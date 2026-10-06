@@ -10,6 +10,9 @@ It builds on [`github.com/eventsalsa/store`](https://github.com/eventsalsa/store
 ## Features
 
 - **Daemon orchestrator** for starting, coordinating, and stopping projection goroutines
+- **Four projection shapes**: transactional or detached, each per-event or batch, selected by a registry builder
+- **Detached projections** for read models outside PostgreSQL, so remote network I/O never holds a pooled connection or the assignment and checkpoint row locks
+- **Batch handlers** for destinations with bulk APIs (multi-row upserts, search-engine bulk import)
 - **Pluggable leader election**: choose between PostgreSQL session-level advisory locks (`pg_try_advisory_lock`) or a PgBouncer-safe table lease heartbeat strategy
 - **Horizontal scaling** through round-robin projection assignment across active projector instances
 - **Gap-aware checkpointing**: probe the frontier, handle only safe rows, and audit stale-gap advances
@@ -17,7 +20,7 @@ It builds on [`github.com/eventsalsa/store`](https://github.com/eventsalsa/store
 - **Wakeup dispatchers**:
   - polling via periodic latest-position checks
   - PostgreSQL `LISTEN`/`NOTIFY` with reconciliation polling fallback
-- **Stream and event filtering decorators** (`FilterStreamTypes`, `FilterEventTypes`)
+- **Stream and event filtering** through registration options (`OnStreamTypes`, `OnEventTypes`) or the deprecated decorators (`FilterStreamTypes`, `FilterEventTypes`)
 - **Pluggable telemetry and metrics observer** for monitoring projection lag, batch duration, throughput, gap skips, and rebalances with zero extra database queries
 - **Migration generation** for projector infrastructure tables
 - **Customizable configuration** via the functional options pattern
@@ -32,6 +35,7 @@ At runtime, each projector daemon instance:
 4. Lets the elected leader rebalance projection assignments across live projector instances.
 5. Runs projection goroutines only for the projections assigned to that instance.
 6. Probes the global frontier outside the batch transaction, then processes only the current safe frontier inside the batch transaction.
+7. For detached projections, applies the safe frontier with no transaction held and persists the checkpoint afterwards in a short transaction.
 
 This design keeps coordination inside PostgreSQL, making the module straightforward to operate in environments that already depend on Postgres.
 
@@ -42,7 +46,7 @@ The module intentionally favors simple, database-native coordination:
 - **Single leader, many instances**: only the elected leader recalculates assignments; every projector instance still heartbeats and processes its own assigned projections.
 - **Advisory-lock or lease-based leadership**: choose between zero-overhead session advisory locks or PgBouncer transaction pooling-safe database leases.
 - **Conservative instance cleanup**: startup may prune `projector_instances` rows only when they are much older than the live-instance timeout, so housekeeping stays less aggressive than rebalance liveness checks.
-- **Scoped handling after frontier probe**: projections decorated with `FilterStreamTypes` or `FilterEventTypes` receive only matching events, but checkpoint correctness comes from an unscoped frontier probe rather than from the last matching filtered row.
+- **Scoped handling after frontier probe**: projections registered with stream or event filters receive only matching events, but checkpoint correctness comes from an unscoped frontier probe rather than from the last matching filtered row.
 - **Broadcast wakeups via close-and-replace channels**: dispatchers notify all waiting projection loops by closing the current wakeup channel and replacing it with a new one.
 - **Adaptive polling**: projection loops start at a base poll interval, back off exponentially when idle, stay hot while blocked on known gaps, and reset immediately when new events are found or a wakeup arrives.
 
@@ -52,7 +56,9 @@ The module intentionally favors simple, database-native coordination:
 .
 ├── cmd/migrate-gen/         # Stable CLI for generating projector infrastructure migrations
 ├── daemon.go / config.go    # Projector Daemon and configuration
-├── projection.go            # Projection interface and filter decorators
+├── projection.go            # Projection interfaces and filter decorators
+├── registry.go              # Projection registry builder and registration filters
+├── applier.go               # Handler-shape adapters and the internal filter decorator
 ├── frontier.go              # Safe frontier and safe harbor calculation
 ├── dispatcher/              # PollDispatcher and NotifyDispatcher
 ├── postgres/                # PostgreSQL DAL for registration, leadership, assignment, checkpoints, gap-skip audit
@@ -132,14 +138,15 @@ func main() {
 
     eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
 
-    projections := []projector.Projection{
-        projector.FilterStreamTypes(&AccountProjection{}, "Account"),
+    registry := projector.NewRegistry()
+    if err := registry.Add(&AccountProjection{}, projector.OnStreamTypes("Account")); err != nil {
+        log.Fatal(err)
     }
 
     daemon := projector.New(
         db,
         eventStore,
-        projections,
+        registry,
         projector.WithBatchSize(100),
         projector.WithPollInterval(500*time.Millisecond),
     )
@@ -158,7 +165,7 @@ func main() {
 Daemons are configured with functional options:
 
 ```go
-daemon := projector.New(db, eventStore, projections,
+daemon := projector.New(db, eventStore, registry,
     projector.WithBatchSize(100),
     projector.WithPollInterval(500*time.Millisecond),
     projector.WithMaxPollInterval(5*time.Second),
@@ -187,7 +194,7 @@ daemon := projector.New(db, eventStore, projections,
 | `WithHeartbeatTimeout(d time.Duration)` | Heartbeat staleness timeout | `30s` |
 | `WithRebalanceInterval(d time.Duration)` | Leader rebalance check interval | `5s` |
 | `WithBatchPause(d time.Duration)` | Pause between consecutive full batches during catch-up | `200ms` |
-| `WithBatchTimeout(d time.Duration)` | Maximum duration for a single batch processing cycle | `30s` |
+| `WithBatchTimeout(d time.Duration)` | Maximum duration for a single batch processing cycle (for detached projections, the external apply) | `30s` |
 | `WithShutdownTimeout(d time.Duration)` | Maximum duration to wait for graceful daemon shutdown | `5s` |
 | `WithMaxConsecutiveFailures(n int)` | Maximum consecutive batch failures before triggering fatal shutdown | `5` |
 | `WithLogger(l store.Logger)` | Custom logger implementation | `store.NoOpLogger{}` |
@@ -253,7 +260,7 @@ eventStore := storepostgres.NewStore(storeConfig)
 daemon := projector.New(
     db,
     eventStore,
-    projections,
+    registry,
     projector.WithDispatcherStrategy(projector.DispatcherStrategyNotify),
     projector.WithNotifyConnectionString(connStr),
     projector.WithNotifyChannel("projector_events"),
@@ -262,33 +269,95 @@ daemon := projector.New(
 
 ## Projection contract
 
+A projection may implement one of four handler shapes. Because Go does not allow two methods with the same name on a type, each type implements exactly one shape and the registry selects its processing path automatically.
+
 ```go
+// Transactional per-event: the read model is in the daemon's database, so the
+// handler writes through tx and the read model and checkpoint commit atomically.
 type Projection interface {
     Name() string
     Handle(ctx context.Context, tx pgx.Tx, event store.PersistedEvent) error
 }
+
+// Detached per-event: the read model is remote. The handler runs with no
+// transaction held, then the checkpoint is persisted in a short transaction.
+type DetachedProjection interface {
+    Name() string
+    Handle(ctx context.Context, event store.PersistedEvent) error
+}
+
+// Transactional batch: one call per batch, still inside the daemon transaction.
+type BatchProjection interface {
+    Name() string
+    Handle(ctx context.Context, tx pgx.Tx, events []store.PersistedEvent) error
+}
+
+// Detached batch: one call per batch with no transaction held.
+type DetachedBatchProjection interface {
+    Name() string
+    Handle(ctx context.Context, events []store.PersistedEvent) error
+}
 ```
+
+Register projections with a `Registry`. `Add` infers the shape; the typed `AddProjection`, `AddDetached`, `AddBatch`, and `AddDetachedBatch` methods are explicit alternatives.
+
+```go
+registry := projector.NewRegistry()
+
+// Transactional per-event, filtered by stream type.
+_ = registry.AddProjection(&AccountProjection{}, projector.OnStreamTypes("Account"))
+
+// Remote search index, applied outside any transaction.
+_ = registry.AddDetached(&TypesenseProductProjection{}, projector.OnStreamTypes("Product"))
+
+daemon := projector.New(db, eventStore, registry)
+```
+
+For daemons that only use the classic shape, `projector.FromProjections(p1, p2)` builds a registry in one call.
+
+### Registration filters
+
+`OnStreamTypes` and `OnEventTypes` limit a projection to matching events. Non-matching events are skipped without error and the checkpoint still advances to the **unscoped** safe frontier, so a filtered projection that matches nothing in a window does not stall.
+
+```go
+_ = registry.AddProjection(myProjection, projector.OnStreamTypes("Account", "Order"))
+_ = registry.AddProjection(myProjection, projector.OnEventTypes("AccountCreated", "AccountClosed"))
+```
+
+`FilterStreamTypes` and `FilterEventTypes` remain for the classic `Projection` shape and are deprecated in favor of registration options.
+
+### Important projection semantics
+
+- Projection names must be unique across the projector daemon.
+- A projection with an empty name is invalid; registration fails.
+- Transactional handlers receive a transaction that also owns checkpoint persistence and must **not** call `Commit` or `Rollback` on it.
+- If a handler returns an error, the batch fails and the checkpoint is not advanced.
+- Filtered events are safely skipped and checkpoints advance normally.
+- `BatchProjection` and `DetachedBatchProjection` receive only events at or below the current safe frontier.
+
+### Detached projections and idempotency
+
+Detached projections are applied outside the daemon transaction and checkpointed afterwards, so remote network I/O never holds a pooled connection or the assignment and checkpoint row locks. In exchange, detached delivery is **at-least-once**: events can be applied again
+
+- after a crash between the external apply and the checkpoint write,
+- when the checkpoint transaction is retried on a serialization failure,
+- when a projection is reassigned during an apply.
+
+Detached handlers must therefore be idempotent. Use a deterministic document id (for example the entity's stream id for state projections) and a monotonic version guard built from `StreamVersion` or `GlobalPosition` so a replayed older event cannot overwrite newer state. Destination error `k` of `N` fails the whole batch; the checkpoint is never advanced past work that was not applied.
+
+The safe-harbor stale-gap behavior applies to detached projections too. Before applying, the daemon revalidates the plan in a short read-only transaction and freezes the applied set and checkpoint target. If the gap closes while the batch is being applied, the checkpoint write is discarded and the batch is re-probed rather than skipping the newly available event.
 
 ### Decorators
 
 Filter decorators allow filtering events before they reach your handler without complicating the handler itself:
 
 ```go
-// Filter by stream type
+// Deprecated: prefer registration options on the registry.
 p := projector.FilterStreamTypes(myProjection, "Account", "Order")
-
-// Filter by event type
-p := projector.FilterEventTypes(myProjection, "AccountCreated", "AccountClosed")
+p = projector.FilterEventTypes(myProjection, "AccountCreated", "AccountClosed")
 ```
 
-### Important projection semantics
-
-- Projection names must be unique across the projector daemon.
-- A projection with an empty name is invalid.
-- `Handle` receives a transaction that also owns checkpoint persistence.
-- Projections must **not** call `Commit` or `Rollback` on the provided transaction.
-- If `Handle` returns an error, the batch fails and the checkpoint is not advanced.
-- Filtered events are safely skipped and checkpoints advance normally.
+These wrappers only support the classic `Projection` shape. New code should use `OnStreamTypes` and `OnEventTypes` at registration, which work for detached and batch handlers too.
 
 ### Checkpoint semantics
 
@@ -311,8 +380,9 @@ For each assigned projection, the daemon repeatedly:
 5. when a gap is stale, advances conservatively to a safe harbor behind the current visible head, or to the earliest reachable visible frontier when the probe window is smaller than the configured lag
 6. opens the batch transaction and calls `Handle` only for rows at or below the target frontier
 7. saves the checkpoint target, records any stale-gap skip, and commits the transaction
+8. for detached projections, applies the frozen rows with no transaction held and then writes the checkpoint, and any stale-gap audit record, in a short transaction
 
-That means read-model updates performed through `tx`, checkpoint moves, and stale-gap audit records stay atomic with one another.
+That means read-model updates performed through `tx`, checkpoint moves, and stale-gap audit records stay atomic with one another for transactional projections. Detached projections give that up in exchange for never holding a pooled connection or the assignment and checkpoint row locks during network I/O; they are at-least-once and require idempotent handlers.
 
 ### Stale-gap behavior
 
@@ -433,7 +503,7 @@ func main() {
     defer stop()
 
     // 1. Initialize domain daemons with lease leader election
-    ledgerDaemon := projector.New(db, ledgerStore, ledgerProjections,
+    ledgerDaemon := projector.New(db, ledgerStore, projector.FromProjections(ledgerProjections...),
         projector.WithLeaderStrategy(projector.LeaderStrategyLease),
         projector.WithProjectorLeaderLeasesTable("ledger.projector_leader_leases"),
         projector.WithProjectorInstancesTable("ledger.projector_instances"),
@@ -442,7 +512,7 @@ func main() {
         projector.WithShutdownTimeout(15*time.Second),
     )
 
-    billingDaemon := projector.New(db, billingStore, billingProjections,
+    billingDaemon := projector.New(db, billingStore, projector.FromProjections(billingProjections...),
         projector.WithLeaderStrategy(projector.LeaderStrategyLease),
         projector.WithProjectorLeaderLeasesTable("billing.projector_leader_leases"),
         projector.WithProjectorInstancesTable("billing.projector_instances"),
@@ -471,6 +541,8 @@ func main() {
 
 1. **Connection Pool Sizing:** Ensure your shared `pgxpool.Pool` has sufficient connections for all concurrent daemons:
    $$\text{PoolSize}_{\text{min}} \ge N_{\text{daemons}} \times (1 + \text{MaxConcurrentProjections}) + \text{Headroom}$$
+
+   Detached projections do not hold a pooled connection while applying to their read model, so they count toward `MaxConcurrentProjections` only for their short probe and checkpoint transactions. Transactional projections hold one connection for the whole handler loop, and the advisory leader strategy pins one additional connection per daemon.
 2. **Lease Tables vs Advisory Locks:** Multi-daemon deployments sharing a PostgreSQL database should use `projector.LeaderStrategyLease` with domain-specific lease tables (e.g. `schema.projector_leader_leases`). `projector.LeaderStrategyAdvisory` uses a single well-known lock key across the database, which would cause unrelated domain daemons to contend for leadership.
 3. **Distinct NOTIFY Channels:** If using `projector.DispatcherStrategyNotify`, assign each domain daemon a unique channel via `projector.WithNotifyChannel("domain_events")` to prevent wakeup crosstalk.
 
@@ -490,7 +562,7 @@ type Observer interface {
 
 ### Telemetry data structures
 
-- **`BatchStats`**: contains batch execution latency (`Duration`), global checkpoint positions (`StartPosition`, `LastPosition`, `HeadPosition`), calculated event lag (`Lag = max(0, HeadPosition - LastPosition)`), throughput counts (`EventsRead`, `EventsHandled`), safe-harbor stale skip indicator (`StaleSkipped`), and error status (`Error`).
+- **`BatchStats`**: contains batch execution latency (`Duration`), global checkpoint positions (`StartPosition`, `LastPosition`, `HeadPosition`), calculated event lag (`Lag = max(0, HeadPosition - LastPosition)`), throughput counts (`EventsRead` for the window and `EventsHandled` for events applied after registration filtering), a safe-harbor stale skip indicator (`StaleSkipped`), a `Detached` flag, and error status (`Error`).
 - **`DaemonStats`**: contains instance UUID (`InstanceID`) and leadership status (`IsLeader`).
 - **`GapStats`**: contains missing sequence coordinate (`GapPosition`), visible stream head (`HighestVisible`), and elapsed duration (`StaleFor`).
 

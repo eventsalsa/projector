@@ -40,6 +40,51 @@ type Projection interface {
 	Handle(ctx context.Context, tx pgx.Tx, event store.PersistedEvent) error
 }
 
+// DetachedProjection is a handler whose read model lives outside the daemon's
+// PostgreSQL database. The daemon applies it with no transaction held and
+// persists the checkpoint afterwards in a short transaction, so slow or failing
+// network I/O never holds a pooled connection or a row lock.
+//
+// Detached application is at-least-once: events can be applied again after a
+// crash between the apply and the checkpoint write, after a serialization
+// failure on the checkpoint transaction, or after an ownership change. Handlers
+// must therefore be idempotent, for example by upserting a document keyed by the
+// stream id with the event's StreamVersion or GlobalPosition as a monotonic
+// version guard.
+type DetachedProjection interface {
+	// Name returns the unique name of this projection.
+	Name() string
+
+	// Handle applies a single event to the external read model.
+	//
+	//nolint:gocritic // hugeParam: Intentionally pass by value to enforce immutability
+	Handle(ctx context.Context, event store.PersistedEvent) error
+}
+
+// BatchProjection is a Projection that applies a whole batch of events in one
+// call, which lets a handler use a destination's bulk API (multi-row upsert,
+// Elasticsearch or Typesense bulk import, and so on).
+type BatchProjection interface {
+	// Name returns the unique name of this projection.
+	Name() string
+
+	// Handle applies every event in the batch. The batch contains only events at
+	// or below the current safe frontier. Returning an error fails the whole
+	// batch and the checkpoint is not advanced.
+	Handle(ctx context.Context, tx pgx.Tx, events []store.PersistedEvent) error
+}
+
+// DetachedBatchProjection is a DetachedProjection that applies a whole batch in
+// one call. The same at-least-once and idempotency requirements apply.
+type DetachedBatchProjection interface {
+	// Name returns the unique name of this projection.
+	Name() string
+
+	// Handle applies every event in the batch to the external read model. The
+	// batch contains only events at or below the current safe frontier.
+	Handle(ctx context.Context, events []store.PersistedEvent) error
+}
+
 type streamTypeFilter struct {
 	Projection
 	allowed map[string]struct{}
@@ -48,6 +93,10 @@ type streamTypeFilter struct {
 // FilterStreamTypes wraps a Projection so that it only processes events
 // belonging to the specified stream types. Events from other stream types
 // are skipped without error, allowing checkpoints to advance safely.
+//
+// Deprecated: register the projection with Registry.Add plus an OnStreamTypes
+// option instead. That form works for every projection shape, including
+// detached and batch handlers.
 func FilterStreamTypes(p Projection, streamTypes ...string) Projection {
 	allowed := make(map[string]struct{}, len(streamTypes))
 	for _, st := range streamTypes {
@@ -90,6 +139,10 @@ type eventTypeFilter struct {
 // FilterEventTypes wraps a Projection so that it only processes events
 // matching the specified event types. Events with other event types
 // are skipped without error, allowing checkpoints to advance safely.
+//
+// Deprecated: register the projection with Registry.Add plus an OnEventTypes
+// option instead. That form works for every projection shape, including
+// detached and batch handlers.
 func FilterEventTypes(p Projection, eventTypes ...string) Projection {
 	allowed := make(map[string]struct{}, len(eventTypes))
 	for _, et := range eventTypes {

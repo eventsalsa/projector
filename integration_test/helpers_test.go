@@ -126,15 +126,28 @@ type gapSkipRow struct {
 }
 
 type testProjectorHarness struct {
-	label    string
-	db       *pgxpool.Pool
-	daemon   *projectorpkg.Daemon
-	cancel   context.CancelFunc
-	errCh    chan error
-	stopOnce sync.Once
+	label       string
+	daemon      *projectorpkg.Daemon
+	cancel      context.CancelFunc
+	done        chan struct{}
+	result      error
+	exitChecked bool
+	stopOnce    sync.Once
 }
 
 func openTestDB(t testing.TB) *pgxpool.Pool {
+	t.Helper()
+
+	return openTestDBWithMaxConns(t, 8)
+}
+
+func openTestDBWithMaxConns(t testing.TB, maxConns int32) *pgxpool.Pool {
+	t.Helper()
+
+	return openTestDBWithAppName(t, maxConns, "")
+}
+
+func openTestDBWithAppName(t testing.TB, maxConns int32, appName string) *pgxpool.Pool {
 	t.Helper()
 
 	host := os.Getenv("POSTGRES_HOST")
@@ -177,7 +190,10 @@ func openTestDB(t testing.TB) *pgxpool.Pool {
 		t.Fatalf("parse test db config: %v", err)
 	}
 
-	config.MaxConns = 8
+	config.MaxConns = maxConns
+	if appName != "" {
+		config.ConnConfig.RuntimeParams["application_name"] = appName
+	}
 
 	if os.Getenv("PGX_TEST_SIMPLE_PROTOCOL") == "true" {
 		config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
@@ -533,32 +549,107 @@ func (c *testProjection) ProcessedCount() int {
 func startTestProjector(t *testing.T, label string, projections []*testProjection, opts ...projectorpkg.Option) *testProjectorHarness {
 	t.Helper()
 
-	db := openTestDB(t)
-	t.Cleanup(func() {
-		db.Close()
-	})
-	eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
-	projectionList := make([]projectorpkg.Projection, 0, len(projections))
+	registry := projectorpkg.NewRegistry()
 	for _, p := range projections {
+		var err error
 		if len(p.streamTypes) > 0 {
-			projectionList = append(projectionList, projectorpkg.FilterStreamTypes(p, p.streamTypes...))
+			err = registry.AddProjection(p, projectorpkg.OnStreamTypes(p.streamTypes...))
 		} else {
-			projectionList = append(projectionList, p)
+			err = registry.AddProjection(p)
+		}
+		if err != nil {
+			t.Fatalf("register projection %s: %v", p.Name(), err)
 		}
 	}
 
-	daemon := projectorpkg.New(db, eventStore, projectionList, opts...)
+	return startTestProjectorFromRegistry(t, label, registry, 8, opts...)
+}
+
+func startTestProjectorFromRegistry(
+	t *testing.T,
+	label string,
+	registry *projectorpkg.Registry,
+	maxConns int32,
+	opts ...projectorpkg.Option,
+) *testProjectorHarness {
+	t.Helper()
+
+	db := openTestDBWithMaxConns(t, maxConns)
+	t.Cleanup(func() {
+		db.Close()
+	})
+
+	return startTestProjectorWithPool(t, label, db, registry, opts...)
+}
+
+// startTestProjectorWithProjections starts a daemon from already-built
+// projections, which is how custom (non-testProjection) handlers are wired.
+func startTestProjectorWithProjections(
+	t *testing.T,
+	label string,
+	projections []projectorpkg.Projection,
+	opts ...projectorpkg.Option,
+) *testProjectorHarness {
+	t.Helper()
+
+	return startTestProjectorWithTables(t, label, projections, projectorpostgres.DefaultProjectorInstancesTable, opts...)
+}
+
+// startTestProjectorWithTables is startTestProjectorWithProjections with a
+// configurable instances table, for schema-qualified configurations.
+func startTestProjectorWithTables(
+	t *testing.T,
+	label string,
+	projections []projectorpkg.Projection,
+	instancesTable string,
+	opts ...projectorpkg.Option,
+) *testProjectorHarness {
+	t.Helper()
+
+	db := openTestDBWithMaxConns(t, 8)
+	t.Cleanup(func() {
+		db.Close()
+	})
+
+	return startTestProjectorWithPoolAndTable(t, label, db, projectorpkg.FromProjections(projections...), instancesTable, opts...)
+}
+
+func startTestProjectorWithPool(
+	t *testing.T,
+	label string,
+	pool projectorpkg.PgxPool,
+	registry *projectorpkg.Registry,
+	opts ...projectorpkg.Option,
+) *testProjectorHarness {
+	t.Helper()
+
+	return startTestProjectorWithPoolAndTable(t, label, pool, registry, projectorpostgres.DefaultProjectorInstancesTable, opts...)
+}
+
+func startTestProjectorWithPoolAndTable(
+	t *testing.T,
+	label string,
+	pool projectorpkg.PgxPool,
+	registry *projectorpkg.Registry,
+	instancesTable string,
+	opts ...projectorpkg.Option,
+) *testProjectorHarness {
+	t.Helper()
+
+	eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
+
+	daemon := projectorpkg.New(pool, eventStore, registry, opts...)
 	ctx, cancel := context.WithCancel(context.Background())
 	harness := &testProjectorHarness{
 		label:  label,
-		db:     db,
 		daemon: daemon,
 		cancel: cancel,
-		errCh:  make(chan error, 1),
+		done:   make(chan struct{}),
 	}
 
 	go func() {
-		harness.errCh <- daemon.Start(ctx)
+		harness.result = daemon.Start(ctx)
+		close(harness.done)
 	}()
 
 	t.Cleanup(func() {
@@ -570,7 +661,7 @@ func startTestProjector(t *testing.T, label string, projections []*testProjectio
 		defer cancel()
 
 		var count int
-		err := db.QueryRow(ctx, `SELECT COUNT(*) FROM projector_instances WHERE instance_id = $1`, daemon.ID()).Scan(&count)
+		err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE instance_id = $1`, instancesTable), daemon.ID()).Scan(&count)
 		if err != nil {
 			return err
 		}
@@ -591,16 +682,32 @@ func (h *testProjectorHarness) stop(tb testing.TB) {
 		h.cancel()
 
 		select {
-		case err := <-h.errCh:
-			if err != nil &&
-				!errors.Is(err, context.Canceled) &&
-				!errors.Is(err, projectorpostgres.ErrInstanceRegistrationMissing) {
-				tb.Fatalf("projector %s stopped with error: %v", h.label, err)
+		case <-h.done:
+			if h.result != nil && !h.exitChecked &&
+				!errors.Is(h.result, context.Canceled) &&
+				!errors.Is(h.result, projectorpostgres.ErrInstanceRegistrationMissing) {
+				tb.Fatalf("projector %s stopped with error: %v", h.label, h.result)
 			}
 		case <-time.After(projectorShutdownTimeout):
 			tb.Fatalf("timeout waiting for projector %s to stop", h.label)
 		}
 	})
+}
+
+// awaitExit waits for the daemon to return on its own and hands back the error,
+// so tests can assert fatal shutdown paths.
+func (h *testProjectorHarness) awaitExit(tb testing.TB, timeout time.Duration) error {
+	tb.Helper()
+
+	h.exitChecked = true
+
+	select {
+	case <-h.done:
+		return h.result
+	case <-time.After(timeout):
+		tb.Fatalf("timeout waiting for projector %s to exit", h.label)
+		return nil
+	}
 }
 
 func defaultProjectorOptions() []projectorpkg.Option {
