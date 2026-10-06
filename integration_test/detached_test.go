@@ -196,7 +196,7 @@ func TestDetachedProjection_ProcessesAndAdvancesCheckpoint(t *testing.T) {
 		t.Fatalf("register detached projection: %v", err)
 	}
 
-	_ = startTestProjectorFromRegistry(t, "projector-1", registry, 8, defaultProjectorOptions()...)
+	harness := startTestProjectorFromRegistry(t, "projector-1", registry, 8, defaultProjectorOptions()...)
 
 	appended := appendTestEvents(t, controlDB, eventStore, 5, "Product")
 	latest := appended[len(appended)-1].GlobalPosition
@@ -210,6 +210,8 @@ func TestDetachedProjection_ProcessesAndAdvancesCheckpoint(t *testing.T) {
 		}
 		return nil
 	})
+
+	harness.stop(t)
 }
 
 func TestDetachedProjection_ApplyErrorDoesNotAdvanceCheckpoint(t *testing.T) {
@@ -231,7 +233,7 @@ func TestDetachedProjection_ApplyErrorDoesNotAdvanceCheckpoint(t *testing.T) {
 	}
 
 	options := append(defaultProjectorOptions(), projectorpkg.WithMaxConsecutiveFailures(0))
-	_ = startTestProjectorFromRegistry(t, "projector-1", registry, 8, options...)
+	harness := startTestProjectorFromRegistry(t, "projector-1", registry, 8, options...)
 
 	appended := appendTestEvents(t, controlDB, eventStore, 2, "Product")
 	latest := appended[len(appended)-1].GlobalPosition
@@ -257,6 +259,8 @@ func TestDetachedProjection_ApplyErrorDoesNotAdvanceCheckpoint(t *testing.T) {
 		}
 		return nil
 	})
+
+	harness.stop(t)
 }
 
 func TestDetachedProjection_DoesNotHoldConnectionDuringRemoteIO(t *testing.T) {
@@ -288,7 +292,7 @@ func TestDetachedProjection_DoesNotHoldConnectionDuringRemoteIO(t *testing.T) {
 	)
 	// A single pooled connection: if the detached handler held it during network
 	// I/O, the transactional projection could never run.
-	_ = startTestProjectorFromRegistry(t, "projector-1", registry, 1, options...)
+	harness := startTestProjectorFromRegistry(t, "projector-1", registry, 1, options...)
 
 	appendTestEvents(t, controlDB, eventStore, 1, "Remote")
 	waitForErr(t, defaultWaitTimeout, func() error {
@@ -314,6 +318,8 @@ func TestDetachedProjection_DoesNotHoldConnectionDuringRemoteIO(t *testing.T) {
 	if len(appendedEvents) != 2 {
 		t.Fatalf("appended %d Tx events, want 2", len(appendedEvents))
 	}
+
+	harness.stop(t)
 }
 
 func TestBatchTransactionalProjection_HandlesWindowInOneCall(t *testing.T) {
@@ -330,7 +336,7 @@ func TestBatchTransactionalProjection_HandlesWindowInOneCall(t *testing.T) {
 		t.Fatalf("register batch projection: %v", err)
 	}
 
-	_ = startTestProjectorFromRegistry(t, "projector-1", registry, 8, defaultProjectorOptions()...)
+	harness := startTestProjectorFromRegistry(t, "projector-1", registry, 8, defaultProjectorOptions()...)
 
 	appended := appendTestEvents(t, controlDB, eventStore, 5, "Order")
 	latest := appended[len(appended)-1].GlobalPosition
@@ -349,6 +355,8 @@ func TestBatchTransactionalProjection_HandlesWindowInOneCall(t *testing.T) {
 	if !ok || size != 5 {
 		t.Fatalf("first batch size = %d (ok=%v), want 5", size, ok)
 	}
+
+	harness.stop(t)
 }
 
 func TestBatchTransactionalProjection_ErrorRollsBackWholeBatch(t *testing.T) {
@@ -370,7 +378,7 @@ func TestBatchTransactionalProjection_ErrorRollsBackWholeBatch(t *testing.T) {
 	}
 
 	options := append(defaultProjectorOptions(), projectorpkg.WithMaxConsecutiveFailures(0))
-	_ = startTestProjectorFromRegistry(t, "projector-1", registry, 8, options...)
+	harness := startTestProjectorFromRegistry(t, "projector-1", registry, 8, options...)
 
 	appended := appendTestEvents(t, controlDB, eventStore, 3, "Order")
 	latest := appended[len(appended)-1].GlobalPosition
@@ -400,6 +408,8 @@ func TestBatchTransactionalProjection_ErrorRollsBackWholeBatch(t *testing.T) {
 		}
 		return nil
 	})
+
+	harness.stop(t)
 }
 
 func TestRegistrationEventTypeFilter_AdvancesCheckpointPastSkippedEvents(t *testing.T) {
@@ -416,7 +426,7 @@ func TestRegistrationEventTypeFilter_AdvancesCheckpointPastSkippedEvents(t *test
 		t.Fatalf("register filtered projection: %v", err)
 	}
 
-	_ = startTestProjectorFromRegistry(t, "projector-1", registry, 8, defaultProjectorOptions()...)
+	harness := startTestProjectorFromRegistry(t, "projector-1", registry, 8, defaultProjectorOptions()...)
 
 	appended := appendTestEventBatches(t, controlDB, eventStore, testEventBatch{StreamType: "Order", Count: 2})
 	latest := appended[len(appended)-1].GlobalPosition
@@ -434,6 +444,8 @@ func TestRegistrationEventTypeFilter_AdvancesCheckpointPastSkippedEvents(t *test
 		}
 		return nil
 	})
+
+	harness.stop(t)
 }
 
 func TestBatchTimeout_CancelsBlockedHandlerWithoutAdvancingCheckpoint(t *testing.T) {
@@ -460,7 +472,7 @@ func TestBatchTimeout_CancelsBlockedHandlerWithoutAdvancingCheckpoint(t *testing
 		projectorpkg.WithMaxConsecutiveFailures(0),
 		projectorpkg.WithBatchTimeout(300*time.Millisecond),
 	)
-	_ = startTestProjectorFromRegistry(t, "projector-1", registry, 8, options...)
+	harness := startTestProjectorFromRegistry(t, "projector-1", registry, 8, options...)
 
 	appended := appendTestEvents(t, controlDB, eventStore, 1, "Order")
 	latest := appended[len(appended)-1].GlobalPosition
@@ -491,4 +503,6 @@ func TestBatchTimeout_CancelsBlockedHandlerWithoutAdvancingCheckpoint(t *testing
 		}
 		return nil
 	})
+
+	harness.stop(t)
 }
