@@ -15,9 +15,10 @@ type BatchStats struct { //nolint:govet // fieldalignment: readability over marg
 	HeadPosition   int64         // Highest visible/known global position
 	Lag            int64         // Global event lag: max(0, HeadPosition - LastPosition)
 	EventsRead     int           // Total events read in the batch window
-	EventsHandled  int           // Total events successfully processed by projection
+	EventsHandled  int           // Events applied by the projection after registration filtering
 	Duration       time.Duration // Total batch duration (fetch + handle + checkpoint commit)
 	StaleSkipped   bool          // True if safe-harbor advanced past an unresolvable stale gap
+	Detached       bool          // True if the projection was applied outside the daemon transaction
 	Error          error         // Non-nil if batch execution failed
 }
 

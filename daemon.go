@@ -79,7 +79,9 @@ type Daemon struct { //nolint:govet // fieldalignment: readability over marginal
 	projectionDone     map[string]chan struct{}
 	db                 PgxPool
 	leaderConn         *pgxpool.Conn
-	projections        []Projection
+	registry           *Registry
+	registrations      []registration
+	registrationByName map[string]registration
 	wg                 sync.WaitGroup
 	mu                 sync.Mutex
 	id                 uuid.UUID
@@ -89,15 +91,16 @@ type Daemon struct { //nolint:govet // fieldalignment: readability over marginal
 }
 
 type processedBatch struct {
-	checkpoint   int64
-	handledCount int
-	progressed   bool
-	blockedByGap bool
-	fullWindow   bool
-	staleSkipped bool
+	checkpoint     int64
+	handledCount   int
+	progressed     bool
+	blockedByGap   bool
+	fullWindow     bool
+	staleSkipped   bool
+	retryRequested bool
 }
 
-type frontierProbe struct {
+type batchPlan struct {
 	firstSeenAt      time.Time
 	rows             []store.PersistedEvent
 	checkpoint       int64
@@ -109,20 +112,32 @@ type frontierProbe struct {
 	staleSkipped     bool
 }
 
-// New constructs a Daemon with the provided database handle, event store, and projections.
-func New(db PgxPool, eventStore projectorStore, projections []Projection, opts ...Option) *Daemon {
+// New constructs a Daemon with the provided database handle, event store, and
+// projection registry. The registry selects the processing path for each
+// projection from its handler shape.
+func New(db PgxPool, eventStore projectorStore, registry *Registry, opts ...Option) *Daemon {
 	config := applyOptions(opts...)
 
-	return &Daemon{
+	daemon := &Daemon{
 		id:                 uuid.New(),
 		db:                 db,
 		store:              eventStore,
-		projections:        append([]Projection(nil), projections...),
+		registry:           registry,
 		config:             config,
 		dispatcher:         newDispatcher(db, eventStore, &config),
 		runningProjections: make(map[string]context.CancelFunc),
 		projectionDone:     make(map[string]chan struct{}),
 	}
+
+	if registry != nil {
+		daemon.registrations = append([]registration(nil), registry.registrations...)
+		daemon.registrationByName = make(map[string]registration, len(daemon.registrations))
+		for _, entry := range daemon.registrations {
+			daemon.registrationByName[entry.name] = entry
+		}
+	}
+
+	return daemon
 }
 
 // ID returns the unique identifier of this projector instance.
@@ -311,22 +326,24 @@ func (d *Daemon) validate() error {
 		}
 	}
 
-	seen := make(map[string]struct{}, len(d.projections))
-	for idx, registeredProjection := range d.projections {
-		if registeredProjection == nil {
-			return fmt.Errorf("projection at index %d is nil", idx)
-		}
+	if d.registry == nil {
+		return ErrNilRegistry
+	}
+	if err := d.registry.validate(); err != nil {
+		return err
+	}
 
-		name := registeredProjection.Name()
-		if name == "" {
+	seen := make(map[string]struct{}, len(d.registrations))
+	for idx, entry := range d.registrations {
+		if strings.TrimSpace(entry.name) == "" {
 			return fmt.Errorf("projection at index %d has empty name", idx)
 		}
 
-		if _, exists := seen[name]; exists {
-			return fmt.Errorf("duplicate projection name %q", name)
+		if _, exists := seen[entry.name]; exists {
+			return fmt.Errorf("duplicate projection name %q", entry.name)
 		}
 
-		seen[name] = struct{}{}
+		seen[entry.name] = struct{}{}
 	}
 
 	return nil
@@ -605,22 +622,22 @@ func (d *Daemon) syncAssignments(ctx, processingCtx context.Context) error {
 		return fmt.Errorf("get assignments: %w", err)
 	}
 
-	desired := make(map[string]Projection, len(d.projections))
+	desired := make(map[string]registration, len(d.registrations))
 	for _, assignment := range assignments {
 		if !assignment.Assigned || assignment.InstanceID != d.id {
 			continue
 		}
 
-		registeredProjection, ok := d.projectionByName(assignment.ProjectionName)
+		entry, ok := d.registrationFor(assignment.ProjectionName)
 		if !ok {
 			continue
 		}
 
-		desired[assignment.ProjectionName] = registeredProjection
+		desired[assignment.ProjectionName] = entry
 	}
 
 	type projectionStart struct {
-		projection Projection
+		projection registration
 		ctx        context.Context
 		done       chan struct{}
 	}
@@ -668,15 +685,15 @@ func (d *Daemon) syncAssignments(ctx, processingCtx context.Context) error {
 	}
 
 	for _, startRequest := range toStart {
-		d.logger().Info(ctx, "starting projection", "instance_id", d.id, "projection", startRequest.projection.Name())
+		d.logger().Info(ctx, "starting projection", "instance_id", d.id, "projection", startRequest.projection.name)
 
 		d.wg.Add(1)
-		go func(projectionCtx context.Context, done chan struct{}, registeredProjection Projection) {
+		go func(projectionCtx context.Context, done chan struct{}, entry registration) {
 			defer d.wg.Done()
 			defer close(done)
-			defer d.finishProjection(registeredProjection.Name(), done)
+			defer d.finishProjection(entry.name, done)
 
-			d.runProjection(ctx, processingCtx, projectionCtx, registeredProjection)
+			d.runProjection(ctx, processingCtx, projectionCtx, entry)
 		}(startRequest.ctx, startRequest.done, startRequest.projection)
 	}
 
@@ -686,10 +703,10 @@ func (d *Daemon) syncAssignments(ctx, processingCtx context.Context) error {
 //nolint:gocyclo // orchestration loop with clear structure
 func (d *Daemon) runProjection(
 	controlCtx, processingCtx, assignmentCtx context.Context,
-	registeredProjection Projection,
+	entry registration,
 ) {
 	logger := d.logger()
-	projectionName := registeredProjection.Name()
+	projectionName := entry.name
 	basePollInterval := d.config.PollInterval
 	currentPollInterval := basePollInterval
 	delay := time.Duration(0)
@@ -726,7 +743,7 @@ func (d *Daemon) runProjection(
 		default:
 		}
 
-		result, err := d.processBatchWithGapState(processingCtx, registeredProjection, gapTracker)
+		result, err := d.processBatchWithGapState(processingCtx, entry, gapTracker)
 		if controlCtx.Err() != nil || assignmentCtx.Err() != nil {
 			return
 		}
@@ -753,6 +770,15 @@ func (d *Daemon) runProjection(
 		}
 
 		consecutiveFailures = 0
+
+		if result.retryRequested {
+			// A detached stale-gap advance was invalidated by a gap that resolved
+			// during the apply. Re-probe immediately; the redundant external apply
+			// is covered by handler idempotency.
+			currentPollInterval = basePollInterval
+			delay = 0
+			continue
+		}
 
 		if !result.progressed {
 			if result.blockedByGap {
@@ -783,15 +809,15 @@ func (d *Daemon) runProjection(
 
 func (d *Daemon) processBatch(
 	parentCtx context.Context,
-	registeredProjection Projection,
+	entry registration,
 	checkpointOverride ...int64,
 ) (processedBatch, error) {
-	return d.processBatchWithGapState(parentCtx, registeredProjection, &gapState{}, checkpointOverride...)
+	return d.processBatchWithGapState(parentCtx, entry, &gapState{}, checkpointOverride...)
 }
 
 func (d *Daemon) processBatchWithGapState(
 	parentCtx context.Context,
-	registeredProjection Projection,
+	entry registration,
 	gapTracker *gapState,
 	checkpointOverride ...int64,
 ) (processedBatch, error) {
@@ -803,12 +829,13 @@ func (d *Daemon) processBatchWithGapState(
 		defer cancel()
 	}
 
-	probe, err := d.probeFrontier(ctx, registeredProjection.Name(), gapTracker, checkpointOverride...)
+	probe, err := d.probePlan(ctx, entry.name, gapTracker, checkpointOverride...)
 	if err != nil {
 		if d.config.Observer != nil {
 			d.config.Observer.OnBatchProcessed(ctx, BatchStats{
-				ProjectionName: registeredProjection.Name(),
+				ProjectionName: entry.name,
 				Duration:       timeNow().Sub(start),
+				Detached:       !entry.applier.transactional(),
 				Error:          err,
 			})
 		}
@@ -826,7 +853,7 @@ func (d *Daemon) processBatchWithGapState(
 		}, nil
 	}
 
-	result, err := d.processProbedBatch(ctx, registeredProjection, &probe)
+	result, err := d.processProbedBatch(ctx, entry, &probe)
 	duration := timeNow().Sub(start)
 	if err != nil {
 		if d.config.Observer != nil {
@@ -836,7 +863,7 @@ func (d *Daemon) processBatchWithGapState(
 				lag = 0
 			}
 			d.config.Observer.OnBatchProcessed(ctx, BatchStats{
-				ProjectionName: registeredProjection.Name(),
+				ProjectionName: entry.name,
 				StartPosition:  probe.checkpoint,
 				LastPosition:   lastPos,
 				HeadPosition:   probe.highestVisible,
@@ -845,6 +872,7 @@ func (d *Daemon) processBatchWithGapState(
 				EventsHandled:  0,
 				Duration:       duration,
 				StaleSkipped:   probe.staleSkipped,
+				Detached:       !entry.applier.transactional(),
 				Error:          err,
 			})
 		}
@@ -855,7 +883,7 @@ func (d *Daemon) processBatchWithGapState(
 		d.logger().Info(ctx,
 			"projection advanced past stale gap",
 			"instance_id", d.id,
-			"projection", registeredProjection.Name(),
+			"projection", entry.name,
 			"gap_position", probe.gapPosition,
 			"checkpoint_from", probe.checkpoint,
 			"checkpoint_to", probe.targetCheckpoint,
@@ -865,7 +893,7 @@ func (d *Daemon) processBatchWithGapState(
 		)
 		if d.config.Observer != nil {
 			d.config.Observer.OnGapSkipped(ctx, GapStats{
-				ProjectionName: registeredProjection.Name(),
+				ProjectionName: entry.name,
 				GapPosition:    probe.gapPosition,
 				HighestVisible: probe.highestVisible,
 				StaleFor:       timeNow().Sub(probe.firstSeenAt),
@@ -880,7 +908,7 @@ func (d *Daemon) processBatchWithGapState(
 			lag = 0
 		}
 		d.config.Observer.OnBatchProcessed(ctx, BatchStats{
-			ProjectionName: registeredProjection.Name(),
+			ProjectionName: entry.name,
 			StartPosition:  probe.checkpoint,
 			LastPosition:   lastPos,
 			HeadPosition:   probe.highestVisible,
@@ -889,6 +917,7 @@ func (d *Daemon) processBatchWithGapState(
 			EventsHandled:  result.handledCount,
 			Duration:       duration,
 			StaleSkipped:   result.staleSkipped,
+			Detached:       !entry.applier.transactional(),
 			Error:          nil,
 		})
 	}
@@ -900,15 +929,15 @@ func (d *Daemon) processBatchWithGapState(
 	return result, nil
 }
 
-func (d *Daemon) probeFrontier(
+func (d *Daemon) probePlan(
 	ctx context.Context,
 	projectionName string,
 	gapTracker *gapState,
 	checkpointOverride ...int64,
-) (frontierProbe, error) {
+) (batchPlan, error) {
 	tx, err := d.db.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return frontierProbe{}, fmt.Errorf("begin frontier probe transaction for projection %s: %w", projectionName, err)
+		return batchPlan{}, fmt.Errorf("begin frontier probe transaction for projection %s: %w", projectionName, err)
 	}
 	defer func() {
 		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
@@ -922,16 +951,16 @@ func (d *Daemon) probeFrontier(
 	} else {
 		checkpoint, err = postgres.GetCheckpoint(ctx, tx, d.projectionCheckpointsTable(), projectionName)
 		if err != nil {
-			return frontierProbe{}, fmt.Errorf("get checkpoint for projection %s: %w", projectionName, err)
+			return batchPlan{}, fmt.Errorf("get checkpoint for projection %s: %w", projectionName, err)
 		}
 	}
 
 	rows, err := d.store.ReadEvents(ctx, tx, checkpoint, d.config.BatchSize)
 	if err != nil {
-		return frontierProbe{}, fmt.Errorf("probe frontier for projection %s: %w", projectionName, err)
+		return batchPlan{}, fmt.Errorf("probe frontier for projection %s: %w", projectionName, err)
 	}
 
-	probe := buildFrontierProbe(checkpoint, rows, d.config.BatchSize)
+	probe := buildBatchPlan(checkpoint, rows, d.config.BatchSize)
 	if len(rows) == 0 || probe.targetCheckpoint > checkpoint {
 		return probe, nil
 	}
@@ -961,21 +990,19 @@ func (d *Daemon) probeFrontier(
 		gapTracker.staleLogged = true
 	}
 
-	safeHarbor, ok := computeGapSkipTarget(probe.gapPosition, rows, d.staleGapHarborLag())
-	if !ok || safeHarbor <= checkpoint {
-		return probe, nil
-	}
-
-	probe.targetCheckpoint = safeHarbor
-	probe.staleSkipped = true
+	applyStaleHarbor(&probe, rows, d.staleGapHarborLag())
 	return probe, nil
 }
 
 func (d *Daemon) processProbedBatch(
 	ctx context.Context,
-	registeredProjection Projection,
-	probe *frontierProbe,
+	entry registration,
+	probe *batchPlan,
 ) (processedBatch, error) {
+	if !entry.applier.transactional() {
+		return d.processDetachedBatch(ctx, entry, probe)
+	}
+
 	txOptions := pgx.TxOptions{}
 	attempts := 1
 	if probe.staleSkipped {
@@ -986,7 +1013,7 @@ func (d *Daemon) processProbedBatch(
 	originalProbe := *probe
 	for attempt := 0; attempt < attempts; attempt++ {
 		attemptProbe := originalProbe
-		result, err := d.processProbedBatchAttempt(ctx, registeredProjection, &attemptProbe, &txOptions)
+		result, err := d.processTxBatchAttempt(ctx, entry, &attemptProbe, &txOptions)
 		if err == nil {
 			*probe = attemptProbe
 			return result, nil
@@ -999,7 +1026,7 @@ func (d *Daemon) processProbedBatch(
 	d.logger().Info(ctx,
 		"stale gap advancement hit serializable contention; retrying later",
 		"instance_id", d.id,
-		"projection", registeredProjection.Name(),
+		"projection", entry.name,
 		"gap_position", originalProbe.gapPosition,
 		"checkpoint", originalProbe.checkpoint,
 		"attempts", attempts,
@@ -1011,15 +1038,17 @@ func (d *Daemon) processProbedBatch(
 	}, nil
 }
 
-func (d *Daemon) processProbedBatchAttempt(
+// processTxBatchAttempt applies a batch inside one transaction so the read model
+// and the checkpoint commit atomically.
+func (d *Daemon) processTxBatchAttempt(
 	ctx context.Context,
-	registeredProjection Projection,
-	probe *frontierProbe,
+	entry registration,
+	probe *batchPlan,
 	txOptions *pgx.TxOptions,
 ) (processedBatch, error) {
 	tx, err := d.db.BeginTx(ctx, *txOptions)
 	if err != nil {
-		return processedBatch{}, fmt.Errorf("begin transaction for projection %s: %w", registeredProjection.Name(), err)
+		return processedBatch{}, fmt.Errorf("begin transaction for projection %s: %w", entry.name, err)
 	}
 
 	committed := false
@@ -1029,19 +1058,19 @@ func (d *Daemon) processProbedBatchAttempt(
 		}
 
 		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
-			d.logger().Error(ctx, "projection transaction rollback failed", "instance_id", d.id, "projection", registeredProjection.Name(), "error", rollbackErr)
+			d.logger().Error(ctx, "projection transaction rollback failed", "instance_id", d.id, "projection", entry.name, "error", rollbackErr)
 		}
 	}()
 
-	assigned, err := d.ensureProjectionOwnership(ctx, tx, registeredProjection.Name())
+	assigned, err := d.ensureProjectionOwnership(ctx, tx, entry.name)
 	if err != nil {
-		return processedBatch{}, fmt.Errorf("check ownership for projection %s: %w", registeredProjection.Name(), err)
+		return processedBatch{}, fmt.Errorf("check ownership for projection %s: %w", entry.name, err)
 	}
 	if !assigned {
 		return processedBatch{}, errProjectionOwnershipLost
 	}
 
-	prepared, proceed, err := d.prepareProbeForBatch(ctx, tx, registeredProjection.Name(), probe)
+	prepared, proceed, err := d.prepareProbeForBatch(ctx, tx, entry.name, probe)
 	if err != nil {
 		return processedBatch{}, err
 	}
@@ -1049,21 +1078,21 @@ func (d *Daemon) processProbedBatchAttempt(
 		return prepared, nil
 	}
 
-	handledCount, err := handleRelevantEvents(ctx, tx, registeredProjection, probe.rows, probe.targetCheckpoint)
+	handledCount, err := entry.applier.apply(ctx, tx, probe.rows)
 	if err != nil {
 		return processedBatch{}, err
 	}
 
-	if err := d.recordStaleGapSkip(ctx, tx, registeredProjection.Name(), probe); err != nil {
+	if err := d.recordStaleGapSkip(ctx, tx, entry.name, probe); err != nil {
 		return processedBatch{}, err
 	}
 
-	if err := postgres.SaveCheckpoint(ctx, tx, d.projectionCheckpointsTable(), registeredProjection.Name(), probe.targetCheckpoint); err != nil {
-		return processedBatch{}, fmt.Errorf("save checkpoint for projection %s: %w", registeredProjection.Name(), err)
+	if err := postgres.SaveCheckpoint(ctx, tx, d.projectionCheckpointsTable(), entry.name, probe.targetCheckpoint); err != nil {
+		return processedBatch{}, fmt.Errorf("save checkpoint for projection %s: %w", entry.name, err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return processedBatch{}, fmt.Errorf("commit transaction for projection %s: %w", registeredProjection.Name(), err)
+		return processedBatch{}, fmt.Errorf("commit transaction for projection %s: %w", entry.name, err)
 	}
 	committed = true
 
@@ -1076,11 +1105,168 @@ func (d *Daemon) processProbedBatchAttempt(
 	}, nil
 }
 
+// processDetachedBatch applies the batch with no transaction held and then
+// persists the checkpoint in a short transaction. Delivery is at-least-once, so
+// handlers must be idempotent.
+func (d *Daemon) processDetachedBatch(
+	ctx context.Context,
+	entry registration,
+	probe *batchPlan,
+) (processedBatch, error) {
+	if probe.staleSkipped {
+		// Freeze the applied set and the checkpoint target before any external
+		// write. Re-deriving the target after the apply could checkpoint past
+		// events that were never applied.
+		if err := d.revalidateDetachedPlan(ctx, entry.name, probe); err != nil {
+			return processedBatch{}, err
+		}
+	}
+
+	if probe.targetCheckpoint <= probe.checkpoint {
+		return processedBatch{
+			blockedByGap: probe.blockedByGap,
+			fullWindow:   probe.fullWindow,
+			checkpoint:   probe.checkpoint,
+		}, nil
+	}
+
+	target := probe.targetCheckpoint
+	handledCount, err := entry.applier.apply(ctx, nil, probe.rows)
+	if err != nil {
+		return processedBatch{}, err
+	}
+
+	result, err := d.commitDetachedCheckpoint(ctx, entry, probe)
+	if err != nil {
+		return processedBatch{}, err
+	}
+	if !result.progressed {
+		// Either the checkpoint moved under us or a resolved gap invalidated the
+		// frozen skip. Both are reported to the loop as-is.
+		return result, nil
+	}
+
+	result.checkpoint = target
+	result.handledCount = handledCount
+	result.fullWindow = probe.fullWindow
+	result.staleSkipped = probe.staleSkipped
+
+	return result, nil
+}
+
+// commitDetachedCheckpoint persists the checkpoint, and any stale-gap skip, in a
+// short transaction. Only this transaction is retried on a serialization
+// failure; the external apply already happened and must not be repeated here.
+func (d *Daemon) commitDetachedCheckpoint(
+	ctx context.Context,
+	entry registration,
+	probe *batchPlan,
+) (processedBatch, error) {
+	txOptions := pgx.TxOptions{}
+	attempts := 1
+	if probe.staleSkipped {
+		txOptions = pgx.TxOptions{IsoLevel: pgx.Serializable}
+		attempts = staleGapRetryLimit
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		result, err := d.commitDetachedCheckpointAttempt(ctx, entry, probe, &txOptions)
+		if err == nil {
+			return result, nil
+		}
+
+		lastErr = err
+		if !isSerializationFailure(err) {
+			return processedBatch{}, err
+		}
+	}
+
+	return processedBatch{}, lastErr
+}
+
+func (d *Daemon) commitDetachedCheckpointAttempt(
+	ctx context.Context,
+	entry registration,
+	probe *batchPlan,
+	txOptions *pgx.TxOptions,
+) (processedBatch, error) {
+	tx, err := d.db.BeginTx(ctx, *txOptions)
+	if err != nil {
+		return processedBatch{}, fmt.Errorf("begin checkpoint transaction for projection %s: %w", entry.name, err)
+	}
+
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			d.logger().Error(ctx, "detached checkpoint rollback failed", "instance_id", d.id, "projection", entry.name, "error", rollbackErr)
+		}
+	}()
+
+	assigned, err := d.ensureProjectionOwnership(ctx, tx, entry.name)
+	if err != nil {
+		return processedBatch{}, fmt.Errorf("check ownership for projection %s: %w", entry.name, err)
+	}
+	if !assigned {
+		return processedBatch{}, errProjectionOwnershipLost
+	}
+
+	currentCheckpoint, err := postgres.GetCheckpointForUpdate(ctx, tx, d.projectionCheckpointsTable(), entry.name)
+	if err != nil {
+		return processedBatch{}, fmt.Errorf("get checkpoint for projection %s: %w", entry.name, err)
+	}
+	if currentCheckpoint != probe.checkpoint {
+		return processedBatch{
+			blockedByGap: true,
+			fullWindow:   probe.fullWindow,
+			checkpoint:   currentCheckpoint,
+		}, nil
+	}
+
+	if probe.staleSkipped {
+		resolved, err := d.detachedGapResolved(ctx, tx, entry.name, probe)
+		if err != nil {
+			return processedBatch{}, err
+		}
+		if resolved {
+			// The gap closed while the batch was applied externally, so the frozen
+			// skip is no longer valid. Discard it and re-probe. The deferred
+			// rollback releases the transaction; the external re-apply is covered
+			// by handler idempotency.
+			return processedBatch{
+				retryRequested: true,
+				blockedByGap:   true,
+				fullWindow:     probe.fullWindow,
+				checkpoint:     probe.checkpoint,
+			}, nil
+		}
+	}
+
+	if err := d.recordStaleGapSkip(ctx, tx, entry.name, probe); err != nil {
+		return processedBatch{}, err
+	}
+
+	if err := postgres.SaveCheckpoint(ctx, tx, d.projectionCheckpointsTable(), entry.name, probe.targetCheckpoint); err != nil {
+		return processedBatch{}, fmt.Errorf("save checkpoint for projection %s: %w", entry.name, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return processedBatch{}, fmt.Errorf("commit checkpoint transaction for projection %s: %w", entry.name, err)
+	}
+	committed = true
+
+	return processedBatch{progressed: true}, nil
+}
+
 func (d *Daemon) prepareProbeForBatch(
 	ctx context.Context,
 	tx pgx.Tx,
 	projectionName string,
-	probe *frontierProbe,
+	probe *batchPlan,
 ) (processedBatch, bool, error) {
 	currentCheckpoint, err := postgres.GetCheckpointForUpdate(ctx, tx, d.projectionCheckpointsTable(), projectionName)
 	if err != nil {
@@ -1097,7 +1283,7 @@ func (d *Daemon) prepareProbeForBatch(
 	if !probe.staleSkipped {
 		return processedBatch{}, true, nil
 	}
-	if err := d.revalidateStaleGapSkip(ctx, tx, projectionName, probe); err != nil {
+	if err := d.revalidatePlan(ctx, tx, projectionName, probe); err != nil {
 		return processedBatch{}, false, err
 	}
 	if probe.targetCheckpoint <= probe.checkpoint {
@@ -1135,7 +1321,7 @@ func (d *Daemon) recordStaleGapSkip(
 	ctx context.Context,
 	tx pgx.Tx,
 	projectionName string,
-	probe *frontierProbe,
+	probe *batchPlan,
 ) error {
 	if !probe.staleSkipped {
 		return nil
@@ -1156,55 +1342,58 @@ func (d *Daemon) recordStaleGapSkip(
 	return nil
 }
 
-func handleRelevantEvents(
-	ctx context.Context,
-	tx pgx.Tx,
-	registeredProjection Projection,
-	events []store.PersistedEvent,
-	upperBound int64,
-) (int, error) {
-	handled := 0
-	for i := range events {
-		if events[i].GlobalPosition > upperBound {
-			break
-		}
-		if err := registeredProjection.Handle(ctx, tx, events[i]); err != nil {
-			return handled, fmt.Errorf("handle event %s for projection %s: %w", events[i].EventID, registeredProjection.Name(), err)
-		}
-		handled++
-	}
-
-	return handled, nil
-}
-
-func buildFrontierProbe(checkpoint int64, rows []store.PersistedEvent, batchSize int) frontierProbe {
-	probe := frontierProbe{
+func buildBatchPlan(checkpoint int64, rows []store.PersistedEvent, batchSize int) batchPlan {
+	plan := batchPlan{
 		checkpoint: checkpoint,
 		rows:       rows,
 		fullWindow: len(rows) == batchSize,
 	}
 	if len(rows) == 0 {
-		return probe
+		return plan
 	}
 
-	probe.highestVisible = rows[len(rows)-1].GlobalPosition
+	plan.highestVisible = rows[len(rows)-1].GlobalPosition
 	safeCount, safeFrontier := computeSafeFrontier(checkpoint, rows)
 	if safeCount > 0 {
-		probe.targetCheckpoint = safeFrontier
-		probe.rows = rows[:safeCount]
-		return probe
+		plan.targetCheckpoint = safeFrontier
+		plan.rows = rows[:safeCount]
+		return plan
 	}
 
-	probe.blockedByGap = true
-	probe.gapPosition = checkpoint + 1
-	return probe
+	plan.blockedByGap = true
+	plan.gapPosition = checkpoint + 1
+	return plan
 }
 
-func (d *Daemon) revalidateStaleGapSkip(
+// applyStaleHarbor derives the safe-harbor target for a plan that is blocked on a
+// gap and freezes the rows at or below that target, so the applied set and the
+// checkpoint target always agree.
+func applyStaleHarbor(plan *batchPlan, rows []store.PersistedEvent, lag int) {
+	safeHarbor, ok := computeGapSkipTarget(plan.gapPosition, rows, lag)
+	if !ok || safeHarbor <= plan.checkpoint {
+		return
+	}
+
+	plan.targetCheckpoint = safeHarbor
+	plan.staleSkipped = true
+	plan.rows = rowsUpTo(rows, safeHarbor)
+}
+
+func rowsUpTo(rows []store.PersistedEvent, target int64) []store.PersistedEvent {
+	for i := range rows {
+		if rows[i].GlobalPosition > target {
+			return rows[:i]
+		}
+	}
+
+	return rows
+}
+
+func (d *Daemon) revalidatePlan(
 	ctx context.Context,
 	tx pgx.Tx,
 	projectionName string,
-	probe *frontierProbe,
+	probe *batchPlan,
 ) error {
 	firstSeenAt := probe.firstSeenAt
 
@@ -1213,23 +1402,45 @@ func (d *Daemon) revalidateStaleGapSkip(
 		return fmt.Errorf("revalidate stale gap frontier for projection %s: %w", projectionName, err)
 	}
 
-	refreshed := buildFrontierProbe(probe.checkpoint, rows, d.config.BatchSize)
+	refreshed := buildBatchPlan(probe.checkpoint, rows, d.config.BatchSize)
 	refreshed.firstSeenAt = firstSeenAt
 	if !refreshed.blockedByGap {
 		*probe = refreshed
 		return nil
 	}
 
-	safeHarbor, ok := computeGapSkipTarget(refreshed.gapPosition, rows, d.staleGapHarborLag())
-	if !ok || safeHarbor <= refreshed.checkpoint {
-		*probe = refreshed
-		return nil
-	}
-
-	refreshed.targetCheckpoint = safeHarbor
-	refreshed.staleSkipped = true
+	applyStaleHarbor(&refreshed, rows, d.staleGapHarborLag())
 	*probe = refreshed
 	return nil
+}
+
+// revalidateDetachedPlan runs the stale-gap revalidation in a short read-only
+// transaction, before any external apply, and freezes the result on probe.
+func (d *Daemon) revalidateDetachedPlan(ctx context.Context, projectionName string, probe *batchPlan) error {
+	tx, err := d.db.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return fmt.Errorf("begin detached revalidation transaction for projection %s: %w", projectionName, err)
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			d.logger().Error(ctx, "detached revalidation rollback failed", "instance_id", d.id, "projection", projectionName, "error", rollbackErr)
+		}
+	}()
+
+	return d.revalidatePlan(ctx, tx, projectionName, probe)
+}
+
+// detachedGapResolved reports whether the gap a frozen stale-skip plan was
+// advancing past has closed. It must be called inside the checkpoint
+// transaction so the decision and the checkpoint write share one view.
+func (d *Daemon) detachedGapResolved(ctx context.Context, tx pgx.Tx, projectionName string, probe *batchPlan) (bool, error) {
+	rows, err := d.store.ReadEvents(ctx, tx, probe.checkpoint, d.config.BatchSize)
+	if err != nil {
+		return false, fmt.Errorf("re-check gap for projection %s: %w", projectionName, err)
+	}
+
+	refreshed := buildBatchPlan(probe.checkpoint, rows, d.config.BatchSize)
+	return !refreshed.blockedByGap, nil
 }
 
 func (d *Daemon) waitForProjectionDelay(controlCtx, assignmentCtx context.Context, delay time.Duration) (woken, ok bool) {
@@ -1413,22 +1624,17 @@ func (d *Daemon) logger() store.Logger {
 }
 
 func (d *Daemon) projectionNames() []string {
-	names := make([]string, 0, len(d.projections))
-	for _, registeredProjection := range d.projections {
-		names = append(names, registeredProjection.Name())
+	names := make([]string, 0, len(d.registrations))
+	for _, entry := range d.registrations {
+		names = append(names, entry.name)
 	}
 
 	return names
 }
 
-func (d *Daemon) projectionByName(name string) (Projection, bool) {
-	for _, registeredProjection := range d.projections {
-		if registeredProjection.Name() == name {
-			return registeredProjection, true
-		}
-	}
-
-	return nil, false
+func (d *Daemon) registrationFor(name string) (registration, bool) {
+	entry, ok := d.registrationByName[name]
+	return entry, ok
 }
 
 func (d *Daemon) projectorInstancesTable() string {

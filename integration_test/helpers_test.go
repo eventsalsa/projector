@@ -547,7 +547,7 @@ func startTestProjector(t *testing.T, label string, projections []*testProjectio
 		}
 	}
 
-	daemon := projectorpkg.New(db, eventStore, projectionList, opts...)
+	daemon := projectorpkg.New(db, eventStore, projectorpkg.FromProjections(projectionList...), opts...)
 	ctx, cancel := context.WithCancel(context.Background())
 	harness := &testProjectorHarness{
 		label:  label,

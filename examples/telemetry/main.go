@@ -138,14 +138,16 @@ func main() {
 	metricsObs := &MetricsObserver{}
 	compositeObserver := projector.MultiObserver(loggingObs, metricsObs)
 
-	projections := []projector.Projection{
-		projector.FilterStreamTypes(&ExampleProjection{}, "Order"),
+	registry := projector.NewRegistry()
+	if err := registry.Add(&ExampleProjection{}, projector.OnStreamTypes("Order")); err != nil {
+		slog.Error("failed to register projection", "error", err)
+		os.Exit(1)
 	}
 
 	daemon := projector.New(
 		db,
 		eventStore,
-		projections,
+		registry,
 		projector.WithBatchSize(100),
 		projector.WithPollInterval(500*time.Millisecond),
 		projector.WithObserver(compositeObserver),

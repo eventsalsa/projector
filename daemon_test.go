@@ -86,6 +86,19 @@ func (c *recordingProjection) Handle(_ context.Context, _ pgx.Tx, event store.Pe
 	return nil
 }
 
+// registrationForTest adapts any projection shape into the daemon's internal
+// registration for white-box tests.
+func registrationForTest(t testing.TB, projection any) registration {
+	t.Helper()
+
+	registry := NewRegistry()
+	if err := registry.Add(projection); err != nil {
+		t.Fatalf("register test projection: %v", err)
+	}
+
+	return registry.registrations[0]
+}
+
 type testDispatcher struct {
 	ch <-chan struct{}
 }
@@ -483,7 +496,7 @@ func TestNewUsesDefaultConfig(t *testing.T) {
 	daemon := New(
 		openStubDB(t, &stubDBState{}),
 		storeStub,
-		[]Projection{&recordingProjection{name: "alpha"}},
+		FromProjections(&recordingProjection{name: "alpha"}),
 	)
 
 	defaults := DefaultConfig()
@@ -503,15 +516,15 @@ func TestNewUsesDefaultConfig(t *testing.T) {
 
 func TestNewCopiesProjectionsAndUsesConfiguredOptions(t *testing.T) {
 	storeStub := &stubProjectorStore{}
-	projections := []Projection{
+	registry := FromProjections(
 		&recordingProjection{name: "alpha"},
 		&recordingProjection{name: "beta"},
-	}
+	)
 
 	daemon := New(
 		openStubDB(t, &stubDBState{}),
 		storeStub,
-		projections,
+		registry,
 		WithBatchSize(7),
 		WithPollInterval(3*time.Second),
 	)
@@ -532,9 +545,9 @@ func TestNewCopiesProjectionsAndUsesConfiguredOptions(t *testing.T) {
 		t.Fatalf("runningProjections length = %d, want 0", len(daemon.runningProjections))
 	}
 
-	projections[0] = &recordingProjection{name: "mutated"}
-	if daemon.projections[0].Name() != "alpha" {
-		t.Fatalf("daemon projections slice was not copied, got %q", daemon.projections[0].Name())
+	registry.registrations[0].name = "mutated"
+	if daemon.registrations[0].name != "alpha" {
+		t.Fatalf("daemon registrations slice was not copied, got %q", daemon.registrations[0].name)
 	}
 }
 
@@ -542,7 +555,7 @@ func TestNewUsesNotifyDispatcherWhenConfigured(t *testing.T) {
 	daemon := New(
 		openStubDB(t, &stubDBState{}),
 		&stubProjectorStore{},
-		[]Projection{&recordingProjection{name: "alpha"}},
+		FromProjections(&recordingProjection{name: "alpha"}),
 		WithDispatcherStrategy(DispatcherStrategyNotify),
 		WithNotifyConnectionString("postgres://projector:test@localhost/db?sslmode=disable"),
 		WithNotifyChannel("custom_events"),
@@ -561,7 +574,23 @@ func TestDaemonValidate(t *testing.T) {
 	validDB := openStubDB(t, &stubDBState{})
 	validStore := &stubProjectorStore{}
 	validDispatcher := &testDispatcher{ch: make(chan struct{})}
-	validProjections := []Projection{&recordingProjection{name: "alpha"}}
+	validRegistry := FromProjections(&recordingProjection{name: "alpha"})
+
+	nilProjectionRegistry := NewRegistry()
+	if err := nilProjectionRegistry.Add(nil); err == nil {
+		t.Fatal("expected registering nil to fail")
+	}
+	emptyNameRegistry := NewRegistry()
+	if err := emptyNameRegistry.AddProjection(&recordingProjection{}); err == nil {
+		t.Fatal("expected registering an empty name to fail")
+	}
+	duplicateRegistry := NewRegistry()
+	if err := duplicateRegistry.AddProjection(&recordingProjection{name: "dup"}); err != nil {
+		t.Fatalf("register first duplicate: %v", err)
+	}
+	if err := duplicateRegistry.AddProjection(&recordingProjection{name: "dup"}); err == nil {
+		t.Fatal("expected registering a duplicate name to fail")
+	}
 
 	tests := []struct {
 		name   string
@@ -570,57 +599,57 @@ func TestDaemonValidate(t *testing.T) {
 	}{
 		{
 			name:   "nil db",
-			daemon: &Daemon{store: validStore, dispatcher: validDispatcher, projections: validProjections},
+			daemon: &Daemon{store: validStore, dispatcher: validDispatcher, registry: validRegistry},
 			errMsg: ErrNilDB.Error(),
 		},
 		{
 			name:   "nil store",
-			daemon: &Daemon{db: validDB, dispatcher: validDispatcher, projections: validProjections},
+			daemon: &Daemon{db: validDB, dispatcher: validDispatcher, registry: validRegistry},
 			errMsg: ErrNilStore.Error(),
 		},
 		{
 			name:   "nil dispatcher",
-			daemon: &Daemon{db: validDB, store: validStore, projections: validProjections},
+			daemon: &Daemon{db: validDB, store: validStore, registry: validRegistry},
 			errMsg: ErrNilDispatcher.Error(),
 		},
 		{
+			name:   "nil registry",
+			daemon: &Daemon{db: validDB, store: validStore, dispatcher: validDispatcher},
+			errMsg: ErrNilRegistry.Error(),
+		},
+		{
 			name:   "nil projection",
-			daemon: &Daemon{db: validDB, store: validStore, dispatcher: validDispatcher, projections: []Projection{nil}},
-			errMsg: "projection at index 0 is nil",
+			daemon: &Daemon{db: validDB, store: validStore, dispatcher: validDispatcher, registry: nilProjectionRegistry},
+			errMsg: ErrNilProjection.Error(),
 		},
 		{
 			name:   "empty projection name",
-			daemon: &Daemon{db: validDB, store: validStore, dispatcher: validDispatcher, projections: []Projection{&recordingProjection{}}},
-			errMsg: "projection at index 0 has empty name",
+			daemon: &Daemon{db: validDB, store: validStore, dispatcher: validDispatcher, registry: emptyNameRegistry},
+			errMsg: ErrEmptyProjectionName.Error(),
 		},
 		{
-			name: "duplicate projection name",
-			daemon: &Daemon{
-				db:          validDB,
-				store:       validStore,
-				dispatcher:  validDispatcher,
-				projections: []Projection{&recordingProjection{name: "dup"}, &recordingProjection{name: "dup"}},
-			},
-			errMsg: `duplicate projection name "dup"`,
+			name:   "duplicate projection name",
+			daemon: &Daemon{db: validDB, store: validStore, dispatcher: validDispatcher, registry: duplicateRegistry},
+			errMsg: `duplicate projection name: "dup"`,
 		},
 		{
 			name: "notify dispatcher requires connection string",
 			daemon: &Daemon{
-				db:          validDB,
-				store:       validStore,
-				dispatcher:  validDispatcher,
-				projections: validProjections,
-				config:      Config{DispatcherStrategy: DispatcherStrategyNotify},
+				db:         validDB,
+				store:      validStore,
+				dispatcher: validDispatcher,
+				registry:   validRegistry,
+				config:     Config{DispatcherStrategy: DispatcherStrategyNotify},
 			},
 			errMsg: ErrMissingNotifyConnectionString.Error(),
 		},
 		{
 			name: "notify dispatcher requires channel",
 			daemon: &Daemon{
-				db:          validDB,
-				store:       validStore,
-				dispatcher:  validDispatcher,
-				projections: validProjections,
+				db:         validDB,
+				store:      validStore,
+				dispatcher: validDispatcher,
+				registry:   validRegistry,
 				config: Config{
 					DispatcherStrategy:     DispatcherStrategyNotify,
 					NotifyConnectionString: "postgres://localhost/db",
@@ -631,10 +660,10 @@ func TestDaemonValidate(t *testing.T) {
 		{
 			name: "valid daemon",
 			daemon: &Daemon{
-				db:          validDB,
-				store:       validStore,
-				dispatcher:  validDispatcher,
-				projections: validProjections,
+				db:         validDB,
+				store:      validStore,
+				dispatcher: validDispatcher,
+				registry:   validRegistry,
 			},
 		},
 	}
@@ -731,7 +760,7 @@ func TestProcessBatchScopedReads(t *testing.T) {
 			config: Config{BatchSize: 10, Logger: store.NoOpLogger{}},
 		}
 
-		_, err := daemon.processBatch(context.Background(), &recordingProjection{name: "global"}, 0)
+		_, err := daemon.processBatch(context.Background(), registrationForTest(t, &recordingProjection{name: "global"}), 0)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
@@ -759,7 +788,7 @@ func TestProcessBatchScopedReads(t *testing.T) {
 			config: Config{BatchSize: 10, Logger: store.NoOpLogger{}},
 		}
 
-		result, err := daemon.processBatch(context.Background(), registeredProjection, 0)
+		result, err := daemon.processBatch(context.Background(), registrationForTest(t, registeredProjection), 0)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
@@ -789,7 +818,7 @@ func TestProcessBatchScopedReads(t *testing.T) {
 			config: Config{BatchSize: 10, Logger: store.NoOpLogger{}},
 		}
 
-		_, err := daemon.processBatch(context.Background(), registeredProjection, 0)
+		_, err := daemon.processBatch(context.Background(), registrationForTest(t, registeredProjection), 0)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
@@ -816,7 +845,7 @@ func TestProcessBatchScopedReads(t *testing.T) {
 			config: Config{BatchSize: 10, Logger: store.NoOpLogger{}},
 		}
 
-		result, err := daemon.processBatch(context.Background(), registeredProjection, 0)
+		result, err := daemon.processBatch(context.Background(), registrationForTest(t, registeredProjection), 0)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
@@ -923,13 +952,13 @@ func TestDaemonStaleGapHarborLagCapsToBatchWindow(t *testing.T) {
 func TestInitializeCleansStaleInstancesBeforeRegistering(t *testing.T) {
 	instanceID := uuid.New()
 	state := &stubDBState{}
+	registry := FromProjections(&recordingProjection{name: "alpha"})
 	daemon := &Daemon{
-		id:     instanceID,
-		db:     openStubDB(t, state),
-		config: Config{HeartbeatTimeout: 5 * time.Second, Logger: store.NoOpLogger{}},
-		projections: []Projection{
-			&recordingProjection{name: "alpha"},
-		},
+		id:            instanceID,
+		db:            openStubDB(t, state),
+		config:        Config{HeartbeatTimeout: 5 * time.Second, Logger: store.NoOpLogger{}},
+		registry:      registry,
+		registrations: registry.registrations,
 	}
 
 	registered := false
@@ -1086,7 +1115,7 @@ func TestProcessBatch(t *testing.T) {
 			config: Config{BatchSize: 2, Logger: store.NoOpLogger{}},
 		}
 
-		result, err := daemon.processBatch(context.Background(), registeredProjection, 3)
+		result, err := daemon.processBatch(context.Background(), registrationForTest(t, registeredProjection), 3)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
@@ -1154,7 +1183,7 @@ func TestProcessBatch(t *testing.T) {
 			config: Config{BatchSize: 3, Logger: store.NoOpLogger{}},
 		}
 
-		result, err := daemon.processBatch(context.Background(), &recordingProjection{name: "empty"}, 0)
+		result, err := daemon.processBatch(context.Background(), registrationForTest(t, &recordingProjection{name: "empty"}), 0)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
@@ -1194,7 +1223,7 @@ func TestProcessBatch(t *testing.T) {
 			},
 		}
 
-		result, err := daemon.processBatch(context.Background(), registeredProjection, 3)
+		result, err := daemon.processBatch(context.Background(), registrationForTest(t, registeredProjection), 3)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
@@ -1240,7 +1269,7 @@ func TestProcessBatch(t *testing.T) {
 			config: Config{BatchSize: 10, Logger: store.NoOpLogger{}},
 		}
 
-		result, err := daemon.processBatch(context.Background(), registeredProjection, 7)
+		result, err := daemon.processBatch(context.Background(), registrationForTest(t, registeredProjection), 7)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
@@ -1269,7 +1298,7 @@ func TestProcessBatch(t *testing.T) {
 			config: Config{BatchSize: 3, Logger: store.NoOpLogger{}},
 		}
 
-		_, err := daemon.processBatch(context.Background(), &recordingProjection{name: "reader"}, 0)
+		_, err := daemon.processBatch(context.Background(), registrationForTest(t, &recordingProjection{name: "reader"}), 0)
 		if err == nil || !strings.Contains(err.Error(), "probe frontier for projection reader: read failed") {
 			t.Fatalf("processBatch() error = %v, want wrapped read error", err)
 		}
@@ -1299,7 +1328,7 @@ func TestProcessBatch(t *testing.T) {
 			},
 		}
 
-		_, err := daemon.processBatch(context.Background(), registeredProjection, 0)
+		_, err := daemon.processBatch(context.Background(), registrationForTest(t, registeredProjection), 0)
 		if err == nil || !strings.Contains(err.Error(), "handle event") || !strings.Contains(err.Error(), "for projection handler: boom") {
 			t.Fatalf("processBatch() error = %v, want wrapped handler error", err)
 		}
@@ -1331,7 +1360,7 @@ func TestProcessBatch(t *testing.T) {
 			config: Config{BatchSize: 1, Logger: store.NoOpLogger{}},
 		}
 
-		_, err := daemon.processBatch(context.Background(), &recordingProjection{name: "checkpoint"}, 0)
+		_, err := daemon.processBatch(context.Background(), registrationForTest(t, &recordingProjection{name: "checkpoint"}), 0)
 		if err == nil || !strings.Contains(err.Error(), "save checkpoint for projection checkpoint: save checkpoint for projection checkpoint: checkpoint failed") {
 			t.Fatalf("processBatch() error = %v, want wrapped checkpoint error", err)
 		}
@@ -1376,7 +1405,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, &recordingProjection{name: "orders"}), gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1390,7 +1419,7 @@ func TestProcessBatch(t *testing.T) {
 		now = base.Add(11 * time.Second)
 
 		secondProjection := &recordingProjection{name: "orders"}
-		second, err := daemon.processBatchWithGapState(context.Background(), secondProjection, gap, 0)
+		second, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, secondProjection), gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v", err)
 		}
@@ -1460,7 +1489,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, &recordingProjection{name: "orders"}), gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1471,7 +1500,7 @@ func TestProcessBatch(t *testing.T) {
 		now = base.Add(11 * time.Second)
 
 		secondProjection := &recordingProjection{name: "orders"}
-		second, err := daemon.processBatchWithGapState(context.Background(), secondProjection, gap, 0)
+		second, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, secondProjection), gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v", err)
 		}
@@ -1538,7 +1567,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, &recordingProjection{name: "orders"}), gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1548,7 +1577,7 @@ func TestProcessBatch(t *testing.T) {
 
 		now = base.Add(11 * time.Second)
 
-		_, err = daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+		_, err = daemon.processBatchWithGapState(context.Background(), registrationForTest(t, &recordingProjection{name: "orders"}), gap, 0)
 		if err == nil || !strings.Contains(err.Error(), "record gap skip for projection orders: gap skip failed") {
 			t.Fatalf("processBatchWithGapState() error = %v, want wrapped gap skip error", err)
 		}
@@ -1601,7 +1630,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, registeredProjection), gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1611,7 +1640,7 @@ func TestProcessBatch(t *testing.T) {
 
 		now = base.Add(11 * time.Second)
 
-		second, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
+		second, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, registeredProjection), gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v", err)
 		}
@@ -1667,7 +1696,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, &recordingProjection{name: "orders"}), gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1681,7 +1710,7 @@ func TestProcessBatch(t *testing.T) {
 		now = base.Add(11 * time.Second)
 
 		secondProjection := &recordingProjection{name: "orders"}
-		second, err := daemon.processBatchWithGapState(context.Background(), secondProjection, gap, 0)
+		second, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, secondProjection), gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v", err)
 		}
@@ -1752,7 +1781,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, &recordingProjection{name: "orders"}), gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1763,7 +1792,7 @@ func TestProcessBatch(t *testing.T) {
 		now = base.Add(11 * time.Second)
 
 		secondProjection := &recordingProjection{name: "orders"}
-		second, err := daemon.processBatchWithGapState(context.Background(), secondProjection, gap, 0)
+		second, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, secondProjection), gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v", err)
 		}
@@ -1828,7 +1857,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, registeredProjection), gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1838,7 +1867,7 @@ func TestProcessBatch(t *testing.T) {
 
 		now = base.Add(11 * time.Second)
 
-		second, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
+		second, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, registeredProjection), gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v", err)
 		}
@@ -1904,7 +1933,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, registeredProjection), gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1914,7 +1943,7 @@ func TestProcessBatch(t *testing.T) {
 
 		now = base.Add(11 * time.Second)
 
-		second, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
+		second, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, registeredProjection), gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v, want nil", err)
 		}
@@ -1973,7 +2002,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, registeredProjection), gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1983,7 +2012,7 @@ func TestProcessBatch(t *testing.T) {
 
 		now = base.Add(11 * time.Second)
 
-		second, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
+		second, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, registeredProjection), gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v", err)
 		}
@@ -2038,7 +2067,7 @@ func TestDaemonObserver_BatchProcessed_Success(t *testing.T) {
 		config: Config{BatchSize: 10, Logger: store.NoOpLogger{}, Observer: observer},
 	}
 
-	result, err := daemon.processBatch(context.Background(), &recordingProjection{name: "orders"}, 0)
+	result, err := daemon.processBatch(context.Background(), registrationForTest(t, &recordingProjection{name: "orders"}), 0)
 	if err != nil {
 		t.Fatalf("processBatch() error = %v", err)
 	}
@@ -2103,7 +2132,7 @@ func TestDaemonObserver_BatchProcessed_FilteredProjections(t *testing.T) {
 		config: Config{BatchSize: 10, Logger: store.NoOpLogger{}, Observer: observer},
 	}
 
-	result, err := daemon.processBatch(context.Background(), filtered, 0)
+	result, err := daemon.processBatch(context.Background(), registrationForTest(t, filtered), 0)
 	if err != nil {
 		t.Fatalf("processBatch() error = %v", err)
 	}
@@ -2148,7 +2177,7 @@ func TestDaemonObserver_BatchProcessed_HandlerError(t *testing.T) {
 		config: Config{BatchSize: 10, Logger: store.NoOpLogger{}, Observer: observer},
 	}
 
-	_, err := daemon.processBatch(context.Background(), proj, 0)
+	_, err := daemon.processBatch(context.Background(), registrationForTest(t, proj), 0)
 	if err == nil {
 		t.Fatal("processBatch() error = nil, want handler error")
 	}
@@ -2185,7 +2214,7 @@ func TestDaemonObserver_BatchProcessed_ProbeError(t *testing.T) {
 		config: Config{BatchSize: 10, Logger: store.NoOpLogger{}, Observer: observer},
 	}
 
-	_, err := daemon.processBatch(context.Background(), &recordingProjection{name: "orders"}, 0)
+	_, err := daemon.processBatch(context.Background(), registrationForTest(t, &recordingProjection{name: "orders"}), 0)
 	if err == nil {
 		t.Fatal("processBatch() error = nil, want read error")
 	}
@@ -2222,7 +2251,7 @@ func TestDaemonObserver_BatchProcessed_CommitError(t *testing.T) {
 		config: Config{BatchSize: 10, Logger: store.NoOpLogger{}, Observer: observer},
 	}
 
-	_, err := daemon.processBatch(context.Background(), &recordingProjection{name: "orders"}, 0)
+	_, err := daemon.processBatch(context.Background(), registrationForTest(t, &recordingProjection{name: "orders"}), 0)
 	if err == nil {
 		t.Fatal("processBatch() error = nil, want commit error")
 	}
@@ -2257,7 +2286,7 @@ func TestDaemonObserver_GapDetected(t *testing.T) {
 	}
 
 	gap := &gapState{}
-	result, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+	result, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, &recordingProjection{name: "orders"}), gap, 0)
 	if err != nil {
 		t.Fatalf("processBatchWithGapState() error = %v", err)
 	}
@@ -2309,7 +2338,7 @@ func TestDaemonObserver_GapSkipped(t *testing.T) {
 	defer func() { timeNow = time.Now }()
 
 	gap := &gapState{}
-	_, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+	_, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, &recordingProjection{name: "orders"}), gap, 0)
 	if err != nil {
 		t.Fatalf("first batch error = %v", err)
 	}
@@ -2317,7 +2346,7 @@ func TestDaemonObserver_GapSkipped(t *testing.T) {
 	// Advance time past StaleGapThreshold
 	timeNow = func() time.Time { return base.Add(50 * time.Millisecond) }
 
-	result, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+	result, err := daemon.processBatchWithGapState(context.Background(), registrationForTest(t, &recordingProjection{name: "orders"}), gap, 0)
 	if err != nil {
 		t.Fatalf("second batch error = %v", err)
 	}
@@ -2446,7 +2475,7 @@ func TestDaemonObserver_NilObserver_Safety(t *testing.T) {
 	}
 
 	// Should not panic on batch processing
-	result, err := daemon.processBatch(context.Background(), &recordingProjection{name: "orders"}, 0)
+	result, err := daemon.processBatch(context.Background(), registrationForTest(t, &recordingProjection{name: "orders"}), 0)
 	if err != nil {
 		t.Fatalf("processBatch() error = %v", err)
 	}
@@ -2459,7 +2488,7 @@ func TestDaemonObserver_NilObserver_Safety(t *testing.T) {
 		{EventID: uuid.New(), GlobalPosition: 5, StreamType: "order"},
 	}
 	gap := &gapState{}
-	_, err = daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+	_, err = daemon.processBatchWithGapState(context.Background(), registrationForTest(t, &recordingProjection{name: "orders"}), gap, 0)
 	if err != nil {
 		t.Fatalf("processBatchWithGapState() error = %v", err)
 	}
@@ -2530,7 +2559,7 @@ func TestDaemon_Start_CanceledContextReturnsNil(t *testing.T) {
 	d := New(
 		openStubDB(t, state),
 		&stubProjectorStore{},
-		[]Projection{&recordingProjection{name: "orders"}},
+		FromProjections(&recordingProjection{name: "orders"}),
 		WithLogger(store.NoOpLogger{}),
 	)
 
