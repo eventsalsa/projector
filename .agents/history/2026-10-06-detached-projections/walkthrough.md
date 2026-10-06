@@ -89,36 +89,43 @@ error skips the checkpoint, checkpoint moved under the apply, gap resolved
 during the apply requests a retry, and a checkpoint serialization failure
 retries without repeating the apply).
 
-Integration tests added:
+Integration tests added (all run under `-race` and `-p 1`, matching CI):
 
-| ID | Test | Covers |
+| Group | IDs | Covers |
 | --- | --- | --- |
-| D1 | `TestDetachedProjection_ProcessesAndAdvancesCheckpoint` | Detached apply outside any tx, checkpoint afterwards |
-| D2 | `TestDetachedProjection_DoesNotHoldConnectionDuringRemoteIO` | A blocked detached handler on a single-connection pool does not stop a transactional projection |
-| D3 | `TestDetachedProjection_ApplyErrorDoesNotAdvanceCheckpoint` | Destination error keeps the checkpoint and recovers |
-| S1 | `TestBatchTransactionalProjection_HandlesWindowInOneCall` | One batch handler call per window |
-| S2 | `TestBatchTransactionalProjection_ErrorRollsBackWholeBatch` | Batch error rolls back the read model and checkpoint |
-| F2 | `TestRegistrationEventTypeFilter_AdvancesCheckpointPastSkippedEvents` | `OnEventTypes` end to end |
-| T1 | `TestBatchTimeout_CancelsBlockedHandlerWithoutAdvancingCheckpoint` | Batch timeout cancels a blocked handler |
+| Detached happy path and isolation | D1, D2, D17 | Apply outside any tx, checkpoint afterwards, a blocked handler on a single-connection pool, no session left `idle in transaction`, and the assignment row lockable during the apply |
+| Detached failures | D3, D4, D5, D8, D9, D10, D16 | Destination error, partial batch failure, checkpoint write failure and replay, checkpoint serialization retry without repeating the apply, ownership lost between apply and checkpoint, shutdown mid-apply, apply past `BatchTimeout` |
+| Detached gaps and progress | D7, D12, D13, D14, D15 | Gap resolved during the apply retries instead of skipping, filter with zero matches, blocked on a gap then resolves, detached batch bulk window, per-event partial failure |
+| Detached checkpoint safety | D6 | Checkpoint advanced by another worker during the apply does not regress |
+| Handler shapes | S1, S2, S3, S4, S7, S8, S9 | Batch window in one call, batch rollback, window boundaries, batch never receives a gapped position, `FromProjections`, deprecated filter wrapper |
+| Registration filters | F2, F3, F4, F5, F6 | Event-type filter, combined stream and event filter, per-projection filter isolation, observer accounting, filter with detached |
+| Cross-cutting | T1, T2, T3 | `BatchTimeout` cancellation, checkpoint row contention, permanent-hole resume after restart without a duplicate skip row |
 
-`rtk make check` (lint, unit with `-race`, integration via testcontainers)
-passes, including the 25 pre-existing integration tests.
+Unit tests cover the registry, the shape adapters, filters, and the detached
+executor, including checkpoint-moved, gap-resolved, and serialization-retry-only
+cases.
+
+`rtk make check` (lint, unit with `-race`, integration via testcontainers) and
+`go test -p 1 -race -tags=integration ./integration_test/...` both pass: 54
+integration tests, including the 25 pre-existing ones.
 
 ## Coverage status
 
-Implemented here: D1, D2, D3, S1, S2, F2, T1.
+Implemented: D1-D10, D12-D17, S1-S4, S7-S9, F2-F6, T1-T3.
 
-Still to add from the review matrix: D4-D17 (partial batch failure,
-crash/checkpoint-failure replay, checkpoint-moved, gap-resolved, ownership
-mid-apply, shutdown, filters with detached, detached batch, apply timeout,
-rebalance isolation), S3-S9 (batch target truncation, batch with gap, mixed
-shapes, registry validation, `FromProjections` equivalence, deprecated wrapper,
-window boundary), F1/F3-F6 (stream filter, combined filters, per-projection
-filter isolation, observer accounting, filter with detached), T2 (checkpoint row
-contention) and T3 (permanent-hole resume).
+Still open in the review matrix: D11 (shutdown timeout with a handler that
+ignores cancellation) and S5 (a daemon mixing all four shapes; D2 covers
+detached plus transactional per-event). S6 (registry validation) is unit-tested
+rather than integration-tested.
+
+One intended deviation: the plan's D15 expected a per-event checkpoint after
+each successful apply. The implementation checkpoints per batch, so a partial
+per-event failure leaves the checkpoint at the batch start and replays the whole
+window, which is what the test asserts. Per-event progress would need an
+executor change and is a design question, not a test gap.
 
 Pre-existing gaps not addressed by this change are tracked separately in the
-review matrix (P1-P10).
+review matrix (P1-P10) and will land on their own branch.
 
 ## Verification
 

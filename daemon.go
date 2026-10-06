@@ -1162,11 +1162,12 @@ func (d *Daemon) commitDetachedCheckpoint(
 	entry registration,
 	probe *batchPlan,
 ) (processedBatch, error) {
+	// The external apply already happened, so a serialization failure here may be
+	// retried freely: only the checkpoint transaction repeats, never the apply.
 	txOptions := pgx.TxOptions{}
-	attempts := 1
+	attempts := staleGapRetryLimit
 	if probe.staleSkipped {
 		txOptions = pgx.TxOptions{IsoLevel: pgx.Serializable}
-		attempts = staleGapRetryLimit
 	}
 
 	var lastErr error

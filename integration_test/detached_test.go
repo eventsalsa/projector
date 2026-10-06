@@ -131,6 +131,12 @@ func (p *batchTestProjection) FirstBatchSize() (int, bool) {
 	return p.batchSizes[0], true
 }
 
+func (p *batchTestProjection) BatchSizes() []int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]int(nil), p.batchSizes...)
+}
+
 func (p *batchTestProjection) SetError(err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -291,8 +297,13 @@ func TestDetachedProjection_DoesNotHoldConnectionDuringRemoteIO(t *testing.T) {
 		projectorpkg.WithLeaderStrategy(projectorpkg.LeaderStrategyLease),
 	)
 	// A single pooled connection: if the detached handler held it during network
-	// I/O, the transactional projection could never run.
-	harness := startTestProjectorFromRegistry(t, "projector-1", registry, 1, options...)
+	// I/O, the transactional projection could never run. The application name lets
+	// us attribute sessions to this daemon in pg_stat_activity.
+	const appName = "detached_io_test"
+	pool := openTestDBWithAppName(t, 1, appName)
+	t.Cleanup(pool.Close)
+
+	harness := startTestProjectorWithPool(t, "projector-1", pool, registry, options...)
 
 	appendTestEvents(t, controlDB, eventStore, 1, "Remote")
 	waitForErr(t, defaultWaitTimeout, func() error {
@@ -313,6 +324,26 @@ func TestDetachedProjection_DoesNotHoldConnectionDuringRemoteIO(t *testing.T) {
 		}
 		return nil
 	})
+
+	ctx := context.Background()
+	var sessions int
+	if err := controlDB.QueryRow(ctx,
+		`SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1`, appName).Scan(&sessions); err != nil {
+		t.Fatalf("query pg_stat_activity sessions: %v", err)
+	}
+	if sessions == 0 {
+		t.Fatal("no daemon sessions found for the test application name; attribution is broken")
+	}
+
+	var idleInTransaction int
+	if err := controlDB.QueryRow(ctx,
+		`SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND state = 'idle in transaction'`,
+		appName).Scan(&idleInTransaction); err != nil {
+		t.Fatalf("query pg_stat_activity idle-in-transaction: %v", err)
+	}
+	if idleInTransaction != 0 {
+		t.Fatalf("%d daemon session(s) idle in transaction while the detached handler was blocked", idleInTransaction)
+	}
 
 	close(gate)
 	if len(appendedEvents) != 2 {

@@ -127,7 +127,6 @@ type gapSkipRow struct {
 
 type testProjectorHarness struct {
 	label    string
-	db       *pgxpool.Pool
 	daemon   *projectorpkg.Daemon
 	cancel   context.CancelFunc
 	errCh    chan error
@@ -141,6 +140,12 @@ func openTestDB(t testing.TB) *pgxpool.Pool {
 }
 
 func openTestDBWithMaxConns(t testing.TB, maxConns int32) *pgxpool.Pool {
+	t.Helper()
+
+	return openTestDBWithAppName(t, maxConns, "")
+}
+
+func openTestDBWithAppName(t testing.TB, maxConns int32, appName string) *pgxpool.Pool {
 	t.Helper()
 
 	host := os.Getenv("POSTGRES_HOST")
@@ -184,6 +189,9 @@ func openTestDBWithMaxConns(t testing.TB, maxConns int32) *pgxpool.Pool {
 	}
 
 	config.MaxConns = maxConns
+	if appName != "" {
+		config.ConnConfig.RuntimeParams["application_name"] = appName
+	}
 
 	if os.Getenv("PGX_TEST_SIMPLE_PROTOCOL") == "true" {
 		config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
@@ -568,13 +576,25 @@ func startTestProjectorFromRegistry(
 	t.Cleanup(func() {
 		db.Close()
 	})
+
+	return startTestProjectorWithPool(t, label, db, registry, opts...)
+}
+
+func startTestProjectorWithPool(
+	t *testing.T,
+	label string,
+	pool projectorpkg.PgxPool,
+	registry *projectorpkg.Registry,
+	opts ...projectorpkg.Option,
+) *testProjectorHarness {
+	t.Helper()
+
 	eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
 
-	daemon := projectorpkg.New(db, eventStore, registry, opts...)
+	daemon := projectorpkg.New(pool, eventStore, registry, opts...)
 	ctx, cancel := context.WithCancel(context.Background())
 	harness := &testProjectorHarness{
 		label:  label,
-		db:     db,
 		daemon: daemon,
 		cancel: cancel,
 		errCh:  make(chan error, 1),
@@ -593,7 +613,7 @@ func startTestProjectorFromRegistry(
 		defer cancel()
 
 		var count int
-		err := db.QueryRow(ctx, `SELECT COUNT(*) FROM projector_instances WHERE instance_id = $1`, daemon.ID()).Scan(&count)
+		err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM projector_instances WHERE instance_id = $1`, daemon.ID()).Scan(&count)
 		if err != nil {
 			return err
 		}
