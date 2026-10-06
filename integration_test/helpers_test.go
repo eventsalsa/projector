@@ -137,6 +137,12 @@ type testProjectorHarness struct {
 func openTestDB(t testing.TB) *pgxpool.Pool {
 	t.Helper()
 
+	return openTestDBWithMaxConns(t, 8)
+}
+
+func openTestDBWithMaxConns(t testing.TB, maxConns int32) *pgxpool.Pool {
+	t.Helper()
+
 	host := os.Getenv("POSTGRES_HOST")
 	if host == "" {
 		host = "localhost"
@@ -177,7 +183,7 @@ func openTestDB(t testing.TB) *pgxpool.Pool {
 		t.Fatalf("parse test db config: %v", err)
 	}
 
-	config.MaxConns = 8
+	config.MaxConns = maxConns
 
 	if os.Getenv("PGX_TEST_SIMPLE_PROTOCOL") == "true" {
 		config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
@@ -533,21 +539,38 @@ func (c *testProjection) ProcessedCount() int {
 func startTestProjector(t *testing.T, label string, projections []*testProjection, opts ...projectorpkg.Option) *testProjectorHarness {
 	t.Helper()
 
-	db := openTestDB(t)
+	registry := projectorpkg.NewRegistry()
+	for _, p := range projections {
+		var err error
+		if len(p.streamTypes) > 0 {
+			err = registry.AddProjection(p, projectorpkg.OnStreamTypes(p.streamTypes...))
+		} else {
+			err = registry.AddProjection(p)
+		}
+		if err != nil {
+			t.Fatalf("register projection %s: %v", p.Name(), err)
+		}
+	}
+
+	return startTestProjectorFromRegistry(t, label, registry, 8, opts...)
+}
+
+func startTestProjectorFromRegistry(
+	t *testing.T,
+	label string,
+	registry *projectorpkg.Registry,
+	maxConns int32,
+	opts ...projectorpkg.Option,
+) *testProjectorHarness {
+	t.Helper()
+
+	db := openTestDBWithMaxConns(t, maxConns)
 	t.Cleanup(func() {
 		db.Close()
 	})
 	eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
-	projectionList := make([]projectorpkg.Projection, 0, len(projections))
-	for _, p := range projections {
-		if len(p.streamTypes) > 0 {
-			projectionList = append(projectionList, projectorpkg.FilterStreamTypes(p, p.streamTypes...))
-		} else {
-			projectionList = append(projectionList, p)
-		}
-	}
 
-	daemon := projectorpkg.New(db, eventStore, projectorpkg.FromProjections(projectionList...), opts...)
+	daemon := projectorpkg.New(db, eventStore, registry, opts...)
 	ctx, cancel := context.WithCancel(context.Background())
 	harness := &testProjectorHarness{
 		label:  label,
