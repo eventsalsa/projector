@@ -129,9 +129,11 @@ type testProjectorHarness struct {
 	label    string
 	db       *pgxpool.Pool
 	daemon   *projectorpkg.Daemon
-	cancel   context.CancelFunc
-	errCh    chan error
-	stopOnce sync.Once
+	cancel      context.CancelFunc
+	done        chan struct{}
+	result      error
+	exitChecked bool
+	stopOnce    sync.Once
 }
 
 func openTestDB(t testing.TB) *pgxpool.Pool {
@@ -533,11 +535,6 @@ func (c *testProjection) ProcessedCount() int {
 func startTestProjector(t *testing.T, label string, projections []*testProjection, opts ...projectorpkg.Option) *testProjectorHarness {
 	t.Helper()
 
-	db := openTestDB(t)
-	t.Cleanup(func() {
-		db.Close()
-	})
-	eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
 	projectionList := make([]projectorpkg.Projection, 0, len(projections))
 	for _, p := range projections {
 		if len(p.streamTypes) > 0 {
@@ -547,18 +544,43 @@ func startTestProjector(t *testing.T, label string, projections []*testProjectio
 		}
 	}
 
-	daemon := projectorpkg.New(db, eventStore, projectionList, opts...)
+	return startTestProjectorWithProjections(t, label, projectionList, opts...)
+}
+
+func startTestProjectorWithProjections(t *testing.T, label string, projections []projectorpkg.Projection, opts ...projectorpkg.Option) *testProjectorHarness {
+	t.Helper()
+
+	return startTestProjectorWithTables(t, label, projections, projectorpostgres.DefaultProjectorInstancesTable, opts...)
+}
+
+func startTestProjectorWithTables(
+	t *testing.T,
+	label string,
+	projections []projectorpkg.Projection,
+	instancesTable string,
+	opts ...projectorpkg.Option,
+) *testProjectorHarness {
+	t.Helper()
+
+	db := openTestDB(t)
+	t.Cleanup(func() {
+		db.Close()
+	})
+	eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
+
+	daemon := projectorpkg.New(db, eventStore, projections, opts...)
 	ctx, cancel := context.WithCancel(context.Background())
 	harness := &testProjectorHarness{
 		label:  label,
 		db:     db,
 		daemon: daemon,
 		cancel: cancel,
-		errCh:  make(chan error, 1),
+		done:   make(chan struct{}),
 	}
 
 	go func() {
-		harness.errCh <- daemon.Start(ctx)
+		harness.result = daemon.Start(ctx)
+		close(harness.done)
 	}()
 
 	t.Cleanup(func() {
@@ -570,7 +592,7 @@ func startTestProjector(t *testing.T, label string, projections []*testProjectio
 		defer cancel()
 
 		var count int
-		err := db.QueryRow(ctx, `SELECT COUNT(*) FROM projector_instances WHERE instance_id = $1`, daemon.ID()).Scan(&count)
+		err := db.QueryRow(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE instance_id = $1`, instancesTable), daemon.ID()).Scan(&count)
 		if err != nil {
 			return err
 		}
@@ -591,16 +613,32 @@ func (h *testProjectorHarness) stop(tb testing.TB) {
 		h.cancel()
 
 		select {
-		case err := <-h.errCh:
-			if err != nil &&
-				!errors.Is(err, context.Canceled) &&
-				!errors.Is(err, projectorpostgres.ErrInstanceRegistrationMissing) {
-				tb.Fatalf("projector %s stopped with error: %v", h.label, err)
+		case <-h.done:
+			if h.result != nil && !h.exitChecked &&
+				!errors.Is(h.result, context.Canceled) &&
+				!errors.Is(h.result, projectorpostgres.ErrInstanceRegistrationMissing) {
+				tb.Fatalf("projector %s stopped with error: %v", h.label, h.result)
 			}
 		case <-time.After(projectorShutdownTimeout):
 			tb.Fatalf("timeout waiting for projector %s to stop", h.label)
 		}
 	})
+}
+
+// awaitExit waits for the daemon to return on its own and hands back the error,
+// so tests can assert fatal shutdown paths.
+func (h *testProjectorHarness) awaitExit(tb testing.TB, timeout time.Duration) error {
+	tb.Helper()
+
+	h.exitChecked = true
+
+	select {
+	case <-h.done:
+		return h.result
+	case <-time.After(timeout):
+		tb.Fatalf("timeout waiting for projector %s to exit", h.label)
+		return nil
+	}
 }
 
 func defaultProjectorOptions() []projectorpkg.Option {
