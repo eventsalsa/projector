@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/eventsalsa/projector/dispatcher"
+	"github.com/eventsalsa/projector/failure"
 	"github.com/eventsalsa/projector/postgres"
 )
 
@@ -77,6 +78,7 @@ type Daemon struct { //nolint:govet // fieldalignment: readability over marginal
 	fatalErrCh         chan error
 	runningProjections map[string]context.CancelFunc
 	projectionDone     map[string]chan struct{}
+	failedProjections  map[string]error
 	db                 PgxPool
 	leaderConn         *pgxpool.Conn
 	registry           *Registry
@@ -99,6 +101,19 @@ type processedBatch struct {
 	staleSkipped   bool
 	retryRequested bool
 }
+
+// batchError carries the batch that produced a handler failure so the projection
+// loop can classify it and, for a Permanent failure, hand the events to a poison
+// handler and advance the checkpoint past them.
+type batchError struct {
+	cause  error
+	rows   []store.PersistedEvent
+	target int64
+}
+
+func (e *batchError) Error() string { return e.cause.Error() }
+
+func (e *batchError) Unwrap() error { return e.cause }
 
 type batchPlan struct {
 	firstSeenAt      time.Time
@@ -126,6 +141,7 @@ func New(db PgxPool, eventStore projectorStore, registry *Registry, opts ...Opti
 		config:             config,
 		dispatcher:         newDispatcher(db, eventStore, &config),
 		runningProjections: make(map[string]context.CancelFunc),
+		failedProjections:  make(map[string]error),
 		projectionDone:     make(map[string]chan struct{}),
 	}
 
@@ -628,6 +644,10 @@ func (d *Daemon) syncAssignments(ctx, processingCtx context.Context) error {
 			continue
 		}
 
+		if d.projectionFailed(assignment.ProjectionName) {
+			continue
+		}
+
 		entry, ok := d.registrationFor(assignment.ProjectionName)
 		if !ok {
 			continue
@@ -711,6 +731,7 @@ func (d *Daemon) runProjection(
 	currentPollInterval := basePollInterval
 	delay := time.Duration(0)
 	consecutiveFailures := 0
+	var firstFailureAt time.Time
 	gapTracker := &gapState{}
 
 	logger.Info(controlCtx, "projection loop started", "instance_id", d.id, "projection", projectionName)
@@ -754,22 +775,89 @@ func (d *Daemon) runProjection(
 				return
 			}
 
+			if firstFailureAt.IsZero() {
+				firstFailureAt = timeNow()
+			}
 			consecutiveFailures++
-			logger.Error(controlCtx, "projection batch failed",
-				"instance_id", d.id, "projection", projectionName,
-				"error", err, "consecutive_failures", consecutiveFailures)
 
-			if d.config.MaxConsecutiveFailures > 0 && consecutiveFailures >= d.config.MaxConsecutiveFailures {
-				d.reportFatal(fmt.Errorf("%w: projection %s failed %d times: %w",
-					ErrConsecutiveFailures, projectionName, consecutiveFailures, err))
+			var failedBatch *batchError
+			hasFailedBatch := errors.As(err, &failedBatch)
+
+			retryable := failure.IsRetryable(err) ||
+				errors.Is(err, context.DeadlineExceeded) ||
+				errors.Is(err, context.Canceled)
+
+			switch {
+			case retryable:
+				logger.Error(controlCtx, "projection batch failed; retrying",
+					"instance_id", d.id, "projection", projectionName,
+					"error", err, "consecutive_failures", consecutiveFailures)
+				d.observeDegraded(controlCtx, projectionName, firstFailureAt, consecutiveFailures, err)
+				currentPollInterval = nextPollInterval(currentPollInterval, d.config.MaxPollInterval, basePollInterval)
+				delay = currentPollInterval
+
+			case failure.IsPermanent(err):
+				if hasFailedBatch && entry.poison != nil {
+					if poisonErr := entry.poison(controlCtx, projectionName, failedBatch.rows, failedBatch.cause); poisonErr != nil {
+						logger.Error(controlCtx, "poison handler rejected the batch; stopping projection",
+							"instance_id", d.id, "projection", projectionName, "error", poisonErr)
+						d.observeDegraded(controlCtx, projectionName, firstFailureAt, consecutiveFailures, poisonErr)
+						d.markProjectionFailed(projectionName, poisonErr)
+						return
+					}
+
+					if skipErr := d.skipPoisonBatch(controlCtx, entry, failedBatch); skipErr != nil {
+						logger.Error(controlCtx, "failed to skip poison batch; stopping projection",
+							"instance_id", d.id, "projection", projectionName, "error", skipErr)
+						d.observeDegraded(controlCtx, projectionName, firstFailureAt, consecutiveFailures, skipErr)
+						d.markProjectionFailed(projectionName, skipErr)
+						return
+					}
+
+					logger.Error(controlCtx, "projection skipped a poison batch",
+						"instance_id", d.id, "projection", projectionName,
+						"target_position", failedBatch.target, "event_count", len(failedBatch.rows), "error", failedBatch.cause)
+					d.observePoisonSkipped(controlCtx, projectionName, failedBatch)
+
+					consecutiveFailures = 0
+					firstFailureAt = time.Time{}
+					delay = 0
+					continue
+				}
+
+				logger.Error(controlCtx, "projection returned a permanent error; stopping projection",
+					"instance_id", d.id, "projection", projectionName, "error", err)
+				d.observeDegraded(controlCtx, projectionName, firstFailureAt, consecutiveFailures, err)
+				d.markProjectionFailed(projectionName, err)
 				return
+
+			case entry.policy == FailurePolicyRetry:
+				logger.Error(controlCtx, "projection batch failed; retrying",
+					"instance_id", d.id, "projection", projectionName,
+					"error", err, "consecutive_failures", consecutiveFailures)
+				d.observeDegraded(controlCtx, projectionName, firstFailureAt, consecutiveFailures, err)
+				currentPollInterval = nextPollInterval(currentPollInterval, d.config.MaxPollInterval, basePollInterval)
+				delay = currentPollInterval
+
+			default:
+				logger.Error(controlCtx, "projection batch failed",
+					"instance_id", d.id, "projection", projectionName,
+					"error", err, "consecutive_failures", consecutiveFailures)
+
+				if d.config.MaxConsecutiveFailures > 0 && consecutiveFailures >= d.config.MaxConsecutiveFailures {
+					d.reportFatal(fmt.Errorf("%w: projection %s failed %d times: %w",
+						ErrConsecutiveFailures, projectionName, consecutiveFailures, err))
+					return
+				}
+
+				delay = currentPollInterval
 			}
 
-			delay = currentPollInterval
 			continue
 		}
 
 		consecutiveFailures = 0
+		firstFailureAt = time.Time{}
 
 		if result.retryRequested {
 			// A detached stale-gap advance was invalidated by a gap that resolved
@@ -805,6 +893,102 @@ func (d *Daemon) runProjection(
 
 		delay = currentPollInterval
 	}
+}
+
+func (d *Daemon) projectionFailed(name string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, failed := d.failedProjections[name]
+
+	return failed
+}
+
+// markProjectionFailed records that a projection stopped permanently so the
+// assignment loop does not restart it until the daemon restarts.
+func (d *Daemon) markProjectionFailed(name string, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.failedProjections == nil {
+		d.failedProjections = make(map[string]error)
+	}
+
+	d.failedProjections[name] = err
+}
+
+func (d *Daemon) observeDegraded(ctx context.Context, projectionName string, firstFailureAt time.Time, consecutive int, err error) {
+	if d.config.Observer == nil {
+		return
+	}
+
+	d.config.Observer.OnProjectionDegraded(ctx, DegradedStats{
+		ProjectionName:      projectionName,
+		FirstFailureAt:      firstFailureAt,
+		ConsecutiveFailures: consecutive,
+		LastError:           err,
+	})
+}
+
+func (d *Daemon) observePoisonSkipped(ctx context.Context, projectionName string, failed *batchError) {
+	if d.config.Observer == nil {
+		return
+	}
+
+	d.config.Observer.OnPoisonBatchSkipped(ctx, PoisonBatchStats{
+		ProjectionName: projectionName,
+		TargetPosition: failed.target,
+		EventCount:     len(failed.rows),
+		Cause:          failed.cause,
+	})
+}
+
+// skipPoisonBatch advances the checkpoint past a batch whose Permanent failure a
+// poison handler has recorded. The batch is not applied to the read model; the
+// handler's dead-letter store is the durable record.
+func (d *Daemon) skipPoisonBatch(ctx context.Context, entry registration, failed *batchError) error {
+	tx, err := d.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin poison skip transaction for projection %s: %w", entry.name, err)
+	}
+
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			d.logger().Error(ctx, "poison skip rollback failed", "instance_id", d.id, "projection", entry.name, "error", rollbackErr)
+		}
+	}()
+
+	assigned, err := d.ensureProjectionOwnership(ctx, tx, entry.name)
+	if err != nil {
+		return fmt.Errorf("check ownership for projection %s: %w", entry.name, err)
+	}
+	if !assigned {
+		return errProjectionOwnershipLost
+	}
+
+	currentCheckpoint, err := postgres.GetCheckpointForUpdate(ctx, tx, d.projectionCheckpointsTable(), entry.name)
+	if err != nil {
+		return fmt.Errorf("get checkpoint for projection %s: %w", entry.name, err)
+	}
+	if currentCheckpoint >= failed.target {
+		return nil
+	}
+
+	if err := postgres.SaveCheckpoint(ctx, tx, d.projectionCheckpointsTable(), entry.name, failed.target); err != nil {
+		return fmt.Errorf("save checkpoint for projection %s: %w", entry.name, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit poison skip transaction for projection %s: %w", entry.name, err)
+	}
+	committed = true
+
+	return nil
 }
 
 func (d *Daemon) processBatch(
@@ -1080,7 +1264,7 @@ func (d *Daemon) processTxBatchAttempt(
 
 	handledCount, err := entry.applier.apply(ctx, tx, probe.rows)
 	if err != nil {
-		return processedBatch{}, err
+		return processedBatch{}, &batchError{cause: err, rows: probe.rows, target: probe.targetCheckpoint}
 	}
 
 	if err := d.recordStaleGapSkip(ctx, tx, entry.name, probe); err != nil {
@@ -1133,7 +1317,7 @@ func (d *Daemon) processDetachedBatch(
 	target := probe.targetCheckpoint
 	handledCount, err := entry.applier.apply(ctx, nil, probe.rows)
 	if err != nil {
-		return processedBatch{}, err
+		return processedBatch{}, &batchError{cause: err, rows: probe.rows, target: target}
 	}
 
 	result, err := d.commitDetachedCheckpoint(ctx, entry, probe)

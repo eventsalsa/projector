@@ -196,7 +196,7 @@ daemon := projector.New(db, eventStore, registry,
 | `WithBatchPause(d time.Duration)` | Pause between consecutive full batches during catch-up | `200ms` |
 | `WithBatchTimeout(d time.Duration)` | Maximum duration for a single batch processing cycle (for detached projections, the external apply) | `30s` |
 | `WithShutdownTimeout(d time.Duration)` | Maximum duration to wait for graceful daemon shutdown | `5s` |
-| `WithMaxConsecutiveFailures(n int)` | Maximum consecutive batch failures before triggering fatal shutdown | `5` |
+| `WithMaxConsecutiveFailures(n int)` | Maximum consecutive unclassified failures before a `FailurePolicyFailFast` projection triggers fatal shutdown | `5` |
 | `WithLogger(l store.Logger)` | Custom logger implementation | `store.NoOpLogger{}` |
 | `WithProjectorInstancesTable(name string)` | Override instance registration table name | `projector_instances` |
 | `WithProjectionAssignmentsTable(name string)` | Override assignment table name | `projection_assignments` |
@@ -346,6 +346,65 @@ Detached projections are applied outside the daemon transaction and checkpointed
 Detached handlers must therefore be idempotent. Use a deterministic document id (for example the entity's stream id for state projections) and a monotonic version guard built from `StreamVersion` or `GlobalPosition` so a replayed older event cannot overwrite newer state. Destination error `k` of `N` fails the whole batch; the checkpoint is never advanced past work that was not applied.
 
 The safe-harbor stale-gap behavior applies to detached projections too. Before applying, the daemon revalidates the plan in a short read-only transaction and freezes the applied set and checkpoint target. If the gap closes while the batch is being applied, the checkpoint write is discarded and the batch is re-probed rather than skipping the newly available event.
+
+### Failure policy
+
+Projection failures are classified so the daemon can decide whether to keep going. Classify an error at the failure site with the `failure` package:
+
+```go
+import projectorfailure "github.com/eventsalsa/projector/failure"
+
+func (p *ProductProjection) Handle(ctx context.Context, event store.PersistedEvent) error {
+    if err := p.client.Upsert(ctx, documentFor(event)); err != nil {
+        if isTransient(err) { // network error, rate limit, 5xx
+            return projectorfailure.Retryable(err)
+        }
+        return projectorfailure.Permanent(err)
+    }
+    return nil
+}
+```
+
+`Retryable` and `Permanent` wrap the original error, so `errors.Is` and `errors.As` still reach the cause. A classified error always takes precedence over the projection's failure policy.
+
+Unclassified errors follow the projection's `FailurePolicy`, which defaults by shape:
+
+- transactional projections (same-database read model): `FailurePolicyFailFast`, the historical behavior
+- detached projections (remote read model): `FailurePolicyRetry`
+
+Override it at registration:
+
+```go
+_ = registry.AddDetached(projection, projector.WithFailurePolicy(projector.FailurePolicyRetry))
+```
+
+| Situation | Daemon behavior |
+| --- | --- |
+| `failure.Retryable(err)`, or a context deadline or cancellation | Back off up to `MaxPollInterval`, retry the batch, never fatal, report `OnProjectionDegraded` |
+| `failure.Permanent(err)`, no poison handler | Stop that projection and report `OnProjectionDegraded`; the daemon, its other projections, and its leadership keep running |
+| `failure.Permanent(err)` with a poison handler returning `nil` | Skip the whole batch, advance the checkpoint past it, report `OnPoisonBatchSkipped`, continue |
+| `failure.Permanent(err)` with a poison handler returning an error | Stop that projection |
+| Unclassified, `FailurePolicyFailFast` | `ErrConsecutiveFailures` after `MaxConsecutiveFailures`; `Start` returns the error |
+| Unclassified, `FailurePolicyRetry` | Same as retryable |
+
+A stopped projection stays stopped for the lifetime of the daemon; fix the cause and restart.
+
+#### Poison handler and dead letters
+
+```go
+_ = registry.AddDetached(projection, projector.WithPoisonHandler(
+    func(ctx context.Context, projectionName string, events []store.PersistedEvent, cause error) error {
+        return myDLQ.Record(ctx, projectionName, events, cause)
+    },
+))
+```
+
+The contract is whole-batch: the handler receives every event in the failing batch and the daemon skips all of them, so a batch that contains one bad document sends its good events to the handler too. For a transactional projection nothing was applied before the skip, because the transaction rolled back. For a detached projection the handler may already have applied some events before the failure; record the whole batch and rely on the at-least-once idempotency rules above. There is no audit table: the handler is the durable record, alongside the `OnPoisonBatchSkipped` signal and a log line.
+
+#### Degradation signals
+
+- `OnProjectionDegraded` fires for every non-fatal failure, with the projection name, the time of the first failure in the current run, the consecutive failure count, and the last error.
+- `OnPoisonBatchSkipped` fires after a poison batch is recorded and skipped.
 
 ### Decorators
 
@@ -556,6 +615,8 @@ type Observer interface {
     OnHeartbeat(ctx context.Context, stats DaemonStats)
     OnGapDetected(ctx context.Context, stats GapStats)
     OnGapSkipped(ctx context.Context, stats GapStats)
+    OnProjectionDegraded(ctx context.Context, stats DegradedStats)
+    OnPoisonBatchSkipped(ctx context.Context, stats PoisonBatchStats)
     OnRebalance(ctx context.Context, assignments map[string]uuid.UUID)
 }
 ```
@@ -565,6 +626,8 @@ type Observer interface {
 - **`BatchStats`**: contains batch execution latency (`Duration`), global checkpoint positions (`StartPosition`, `LastPosition`, `HeadPosition`), calculated event lag (`Lag = max(0, HeadPosition - LastPosition)`), throughput counts (`EventsRead` for the window and `EventsHandled` for events applied after registration filtering), a safe-harbor stale skip indicator (`StaleSkipped`), a `Detached` flag, and error status (`Error`).
 - **`DaemonStats`**: contains instance UUID (`InstanceID`) and leadership status (`IsLeader`).
 - **`GapStats`**: contains missing sequence coordinate (`GapPosition`), visible stream head (`HighestVisible`), and elapsed duration (`StaleFor`).
+- **`DegradedStats`**: contains the projection name, the time of the first failure in the current run (`FirstFailureAt`), the consecutive failure count, and the last error, reported for failures that do not stop the daemon.
+- **`PoisonBatchStats`**: contains the projection name, the checkpoint target the batch was skipped to, the event count, and the cause, reported after a poison handler records a batch.
 
 ### Convenience utilities
 

@@ -23,6 +23,8 @@ type testIntegrationObserver struct {
 	heartbeats []projectorpkg.DaemonStats
 	gaps       []projectorpkg.GapStats
 	skipped    []projectorpkg.GapStats
+	degraded   []projectorpkg.DegradedStats
+	poison     []projectorpkg.PoisonBatchStats
 	rebalances []map[string]uuid.UUID
 }
 
@@ -49,6 +51,18 @@ func (o *testIntegrationObserver) OnGapSkipped(_ context.Context, stats projecto
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.skipped = append(o.skipped, stats)
+}
+
+func (o *testIntegrationObserver) OnProjectionDegraded(_ context.Context, stats projectorpkg.DegradedStats) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.degraded = append(o.degraded, stats)
+}
+
+func (o *testIntegrationObserver) OnPoisonBatchSkipped(_ context.Context, stats projectorpkg.PoisonBatchStats) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.poison = append(o.poison, stats)
 }
 
 func (o *testIntegrationObserver) OnRebalance(_ context.Context, assignments map[string]uuid.UUID) {
@@ -83,6 +97,18 @@ func (o *testIntegrationObserver) Skipped() []projectorpkg.GapStats {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return append([]projectorpkg.GapStats(nil), o.skipped...)
+}
+
+func (o *testIntegrationObserver) Degraded() []projectorpkg.DegradedStats {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]projectorpkg.DegradedStats(nil), o.degraded...)
+}
+
+func (o *testIntegrationObserver) PoisonSkipped() []projectorpkg.PoisonBatchStats {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]projectorpkg.PoisonBatchStats(nil), o.poison...)
 }
 
 func (o *testIntegrationObserver) Rebalances() []map[string]uuid.UUID {
