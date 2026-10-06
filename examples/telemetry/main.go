@@ -76,6 +76,24 @@ func (l *LoggingObserver) OnGapSkipped(ctx context.Context, stats projector.GapS
 	)
 }
 
+func (l *LoggingObserver) OnProjectionDegraded(ctx context.Context, stats projector.DegradedStats) {
+	l.logger.WarnContext(ctx, "projection degraded",
+		"projection", stats.ProjectionName,
+		"consecutive_failures", stats.ConsecutiveFailures,
+		"first_failure_at", stats.FirstFailureAt,
+		"error", stats.LastError,
+	)
+}
+
+func (l *LoggingObserver) OnPoisonBatchSkipped(ctx context.Context, stats projector.PoisonBatchStats) {
+	l.logger.ErrorContext(ctx, "poison batch skipped",
+		"projection", stats.ProjectionName,
+		"target_position", stats.TargetPosition,
+		"event_count", stats.EventCount,
+		"error", stats.Cause,
+	)
+}
+
 func (l *LoggingObserver) OnRebalance(ctx context.Context, assignments map[string]uuid.UUID) {
 	l.logger.InfoContext(ctx, "rebalance assignments updated",
 		"assignments_count", len(assignments),

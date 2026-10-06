@@ -36,6 +36,25 @@ type GapStats struct {
 	StaleFor       time.Duration
 }
 
+// DegradedStats is reported when a projection fails without the daemon treating
+// the failure as fatal, for example after a failure classified as retryable or
+// under FailurePolicyRetry.
+type DegradedStats struct { //nolint:govet // fieldalignment: readability over marginal memory savings
+	ProjectionName      string
+	FirstFailureAt      time.Time
+	ConsecutiveFailures int
+	LastError           error
+}
+
+// PoisonBatchStats is reported after a Permanent failure has been recorded by a
+// poison handler and the checkpoint has advanced past the batch.
+type PoisonBatchStats struct { //nolint:govet // fieldalignment: readability over marginal memory savings
+	ProjectionName string
+	TargetPosition int64
+	EventCount     int
+	Cause          error
+}
+
 // Observer receives real-time telemetry and lifecycle events from the projector daemon.
 // All implementations must be safe for concurrent execution across multiple goroutines.
 type Observer interface {
@@ -51,6 +70,14 @@ type Observer interface {
 
 	// OnGapSkipped is called when safe-harbor advancement skips an unresolvable stale gap.
 	OnGapSkipped(ctx context.Context, stats GapStats)
+
+	// OnProjectionDegraded is called when a projection fails without the failure
+	// being fatal, so operators can alert on sustained degradation.
+	OnProjectionDegraded(ctx context.Context, stats DegradedStats)
+
+	// OnPoisonBatchSkipped is called after a Permanent failure is recorded by a
+	// poison handler and the checkpoint advances past the batch.
+	OnPoisonBatchSkipped(ctx context.Context, stats PoisonBatchStats)
 
 	// OnRebalance is called when projection partition assignments are updated.
 	OnRebalance(ctx context.Context, assignments map[string]uuid.UUID)
@@ -73,6 +100,12 @@ func (NoopObserver) OnGapDetected(context.Context, GapStats) {}
 
 // OnGapSkipped is a no-op implementation.
 func (NoopObserver) OnGapSkipped(context.Context, GapStats) {}
+
+// OnProjectionDegraded is a no-op implementation.
+func (NoopObserver) OnProjectionDegraded(context.Context, DegradedStats) {}
+
+// OnPoisonBatchSkipped is a no-op implementation.
+func (NoopObserver) OnPoisonBatchSkipped(context.Context, PoisonBatchStats) {}
 
 // OnRebalance is a no-op implementation.
 func (NoopObserver) OnRebalance(context.Context, map[string]uuid.UUID) {}
@@ -127,6 +160,18 @@ func (mo multiObserver) OnGapDetected(ctx context.Context, stats GapStats) {
 func (mo multiObserver) OnGapSkipped(ctx context.Context, stats GapStats) {
 	for _, o := range mo {
 		o.OnGapSkipped(ctx, stats)
+	}
+}
+
+func (mo multiObserver) OnProjectionDegraded(ctx context.Context, stats DegradedStats) {
+	for _, o := range mo {
+		o.OnProjectionDegraded(ctx, stats)
+	}
+}
+
+func (mo multiObserver) OnPoisonBatchSkipped(ctx context.Context, stats PoisonBatchStats) {
+	for _, o := range mo {
+		o.OnPoisonBatchSkipped(ctx, stats)
 	}
 }
 

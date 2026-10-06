@@ -106,7 +106,9 @@ type scriptedDetachedProjection struct {
 	mu       sync.Mutex
 	failures map[int64]int
 	err      error
+	failAll  error
 	applied  map[int64]int
+	attempts int
 }
 
 func (p *scriptedDetachedProjection) Name() string { return p.name }
@@ -134,6 +136,11 @@ func (p *scriptedDetachedProjection) Handle(ctx context.Context, event store.Per
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.attempts++
+
+	if p.failAll != nil {
+		return p.failAll
+	}
 
 	if remaining, ok := p.failures[event.GlobalPosition]; ok && remaining != 0 {
 		if remaining > 0 {
@@ -159,6 +166,14 @@ func (p *scriptedDetachedProjection) failAt(position int64, times int, err error
 	p.err = err
 }
 
+// failEveryEvent makes the handler return err for every event, regardless of
+// position.
+func (p *scriptedDetachedProjection) failEveryEvent(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.failAll = err
+}
+
 func (p *scriptedDetachedProjection) timesApplied(position int64) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -169,6 +184,12 @@ func (p *scriptedDetachedProjection) uniqueApplied() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.applied)
+}
+
+func (p *scriptedDetachedProjection) Attempts() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.attempts
 }
 
 // scriptedDetachedBatchProjection is a DetachedBatchProjection that applies its

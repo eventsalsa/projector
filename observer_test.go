@@ -16,6 +16,8 @@ type recordingObserver struct {
 	heartbeats []DaemonStats
 	gaps       []GapStats
 	skipped    []GapStats
+	degraded   []DegradedStats
+	poison     []PoisonBatchStats
 	rebalances []map[string]uuid.UUID
 }
 
@@ -42,6 +44,18 @@ func (r *recordingObserver) OnGapSkipped(_ context.Context, stats GapStats) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.skipped = append(r.skipped, stats)
+}
+
+func (r *recordingObserver) OnProjectionDegraded(_ context.Context, stats DegradedStats) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.degraded = append(r.degraded, stats)
+}
+
+func (r *recordingObserver) OnPoisonBatchSkipped(_ context.Context, stats PoisonBatchStats) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.poison = append(r.poison, stats)
 }
 
 func (r *recordingObserver) OnRebalance(_ context.Context, assignments map[string]uuid.UUID) {
@@ -76,6 +90,18 @@ func (r *recordingObserver) Skipped() []GapStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]GapStats(nil), r.skipped...)
+}
+
+func (r *recordingObserver) Degraded() []DegradedStats {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]DegradedStats(nil), r.degraded...)
+}
+
+func (r *recordingObserver) PoisonSkipped() []PoisonBatchStats {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]PoisonBatchStats(nil), r.poison...)
 }
 
 func (r *recordingObserver) Rebalances() []map[string]uuid.UUID {

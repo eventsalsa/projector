@@ -1,10 +1,13 @@
 package projector
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
 	"strings"
+
+	"github.com/eventsalsa/store"
 )
 
 var (
@@ -29,6 +32,8 @@ var (
 type registration struct { //nolint:govet // fieldalignment: readability over marginal memory savings
 	name    string
 	applier applier
+	policy  FailurePolicy
+	poison  PoisonHandler
 }
 
 // Registry collects the projections for a Daemon and selects the right
@@ -131,20 +136,36 @@ func (r *Registry) add(name string, a applier, opts ...RegistrationOption) error
 		return r.record(fmt.Errorf("%w: %q", ErrDuplicateProjectionName, name))
 	}
 
-	var spec filterSpec
+	var cfg registrationConfig
 	for _, opt := range opts {
 		if opt != nil {
-			opt(&spec)
+			opt(&cfg)
 		}
 	}
 
 	r.names[name] = struct{}{}
 	r.registrations = append(r.registrations, registration{
 		name:    name,
-		applier: wrapFilters(a, spec),
+		applier: wrapFilters(a, cfg.filterSpec),
+		policy:  resolveFailurePolicy(cfg, a),
+		poison:  cfg.poison,
 	})
 
 	return nil
+}
+
+// resolveFailurePolicy applies the shape-derived default when the caller did not
+// pick a policy: transactional projections fail fast, detached ones retry.
+func resolveFailurePolicy(cfg registrationConfig, a applier) FailurePolicy {
+	if cfg.policySet {
+		return cfg.policy
+	}
+
+	if a.transactional() {
+		return FailurePolicyFailFast
+	}
+
+	return FailurePolicyRetry
 }
 
 func (r *Registry) record(err error) error {
@@ -163,15 +184,71 @@ func (r *Registry) validate() error {
 	return r.err
 }
 
+// registrationConfig is the mutable state the registration options act on.
+type registrationConfig struct { //nolint:govet // fieldalignment: readability over marginal memory savings
+	filterSpec
+	policy    FailurePolicy
+	policySet bool
+	poison    PoisonHandler
+}
+
 // RegistrationOption configures how a projection is registered.
-type RegistrationOption func(*filterSpec)
+type RegistrationOption func(*registrationConfig)
+
+// FailurePolicy decides what the daemon does with an unclassified batch failure.
+// Errors classified through the failure package always take precedence over the
+// policy.
+type FailurePolicy int
+
+const (
+	// FailurePolicyFailFast stops the daemon with ErrConsecutiveFailures after
+	// MaxConsecutiveFailures unclassified failures. This is the default for
+	// transactional projections, where repeated failures usually indicate a bug.
+	FailurePolicyFailFast FailurePolicy = iota
+
+	// FailurePolicyRetry backs off and retries the batch without ever treating the
+	// failure as fatal, reporting degradation through the observer. This is the
+	// default for detached projections, whose failures are usually transient
+	// failures of a remote read model.
+	FailurePolicyRetry
+)
+
+// PoisonHandler is called when a projection returns an error classified as
+// Permanent and a poison handler is registered for it.
+//
+// It receives the whole failing batch, so a batch that contains one bad event
+// sends every event in that batch to the handler. Returning nil tells the daemon
+// the batch has been recorded and may be skipped: the checkpoint advances past
+// the batch and the projection continues. Returning an error stops the
+// projection.
+//
+// See the package documentation for the durability and idempotency caveats.
+type PoisonHandler func(ctx context.Context, projectionName string, events []store.PersistedEvent, cause error) error
+
+// WithFailurePolicy overrides the failure policy for a projection. The default is
+// FailurePolicyFailFast for transactional projections and FailurePolicyRetry for
+// detached projections.
+func WithFailurePolicy(policy FailurePolicy) RegistrationOption {
+	return func(cfg *registrationConfig) {
+		cfg.policy = policy
+		cfg.policySet = true
+	}
+}
+
+// WithPoisonHandler registers a dead-letter callback invoked when the projection
+// returns a Permanent error. See PoisonHandler for the contract.
+func WithPoisonHandler(handler PoisonHandler) RegistrationOption {
+	return func(cfg *registrationConfig) {
+		cfg.poison = handler
+	}
+}
 
 // OnStreamTypes limits a projection to the given stream types. Events from other
 // stream types are skipped while checkpoints still advance to the unscoped
 // safe frontier.
 func OnStreamTypes(streamTypes ...string) RegistrationOption {
-	return func(spec *filterSpec) {
-		spec.streamTypes = stringSet(streamTypes)
+	return func(cfg *registrationConfig) {
+		cfg.streamTypes = stringSet(streamTypes)
 	}
 }
 
@@ -179,8 +256,8 @@ func OnStreamTypes(streamTypes ...string) RegistrationOption {
 // event types are skipped while checkpoints still advance to the unscoped
 // safe frontier.
 func OnEventTypes(eventTypes ...string) RegistrationOption {
-	return func(spec *filterSpec) {
-		spec.eventTypes = stringSet(eventTypes)
+	return func(cfg *registrationConfig) {
+		cfg.eventTypes = stringSet(eventTypes)
 	}
 }
 
