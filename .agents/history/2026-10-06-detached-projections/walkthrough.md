@@ -106,26 +106,47 @@ executor, including checkpoint-moved, gap-resolved, and serialization-retry-only
 cases.
 
 `rtk make check` (lint, unit with `-race`, integration via testcontainers) and
-`go test -p 1 -race -tags=integration ./integration_test/...` both pass: 54
+`go test -p 1 -race -tags=integration ./integration_test/...` both pass: 63
 integration tests, including the 25 pre-existing ones.
+
+### Pre-existing gaps closed (consolidated onto this branch)
+
+The pre-existing coverage gaps found during the audit are included here rather
+than in a separate PR:
+
+| ID | Test | Covers |
+| --- | --- | --- |
+| P1 | `TestGap_RealSerializationFailureIsRetried` | A genuine server-side SQLSTATE 40001 on a checkpoint write fails the batch and the daemon recovers on retry |
+| P2 | `TestGap_CheckpointNeverRegresses` | `SaveCheckpoint`'s `GREATEST` guard rejects a lower position |
+| P4 | `TestGap_HeartbeatRegistrationLossIsFatal` | Losing the instance registration makes `Start` return `ErrInstanceRegistrationMissing` |
+| P5 | `TestGap_MaxConsecutiveFailuresIsFatal` | Exceeding `MaxConsecutiveFailures` makes `Start` return `ErrConsecutiveFailures` |
+| P6 | `TestGap_GracefulShutdownDrainsInFlightBatch` | An in-flight transactional batch commits within `ShutdownTimeout` on `Stop` |
+| P7 | `TestGap_ErrgroupPropagatesFatalToSibling` | Two daemons sharing a pool in an `errgroup`: a fatal in one returns from `Wait` |
+| P8 | `TestGap_SequentialStaleSkipsAreAudited` | Two sequential stale gaps produce two distinct audit rows |
+| P9 | `TestGap_SchemaQualifiedProjectorTables` | A daemon configured with `infra.*` projector tables registers and checkpoints there, leaving the default tables untouched |
+
+The integration harness now records the daemon's exit result and exposes
+`awaitExit`, so fatal shutdown paths can be asserted, and gains starters that
+accept arbitrary projections and a configurable instances table. `P3` (the
+transactional-path gap-resolution branch) is not deterministically controllable
+from a test; `P10` (a connection drop during the detached checkpoint) remains
+open. `golang.org/x/sync` is promoted to a direct dependency because a test
+imports `errgroup`.
 
 ## Coverage status
 
-Implemented: D1-D10, D12-D17, S1-S4, S7-S9, F2-F6, T1-T3.
+Implemented: D1-D10, D12-D17, S1-S4, S7-S9, F2-F6, T1-T3, P1, P2, P4-P9.
 
 Still open in the review matrix: D11 (shutdown timeout with a handler that
 ignores cancellation) and S5 (a daemon mixing all four shapes; D2 covers
 detached plus transactional per-event). S6 (registry validation) is unit-tested
-rather than integration-tested.
+rather than integration-tested. P3 and P10 are noted above.
 
 One intended deviation: the plan's D15 expected a per-event checkpoint after
 each successful apply. The implementation checkpoints per batch, so a partial
 per-event failure leaves the checkpoint at the batch start and replays the whole
 window, which is what the test asserts. Per-event progress would need an
 executor change and is a design question, not a test gap.
-
-Pre-existing gaps not addressed by this change are tracked separately in the
-review matrix (P1-P10) and will land on their own branch.
 
 ## Verification
 
