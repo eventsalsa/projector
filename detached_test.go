@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/eventsalsa/store"
 	"github.com/google/uuid"
@@ -34,7 +35,7 @@ func TestProcessDetachedBatchCommitsCheckpoint(t *testing.T) {
 		rows:             []store.PersistedEvent{unitTestEvent(1, "order"), unitTestEvent(2, "order")},
 	}
 
-	result, err := daemon.processDetachedBatch(context.Background(), entry, &plan)
+	result, err := daemon.processDetachedBatch(context.Background(), context.Background(), entry, &plan)
 	if err != nil {
 		t.Fatalf("processDetachedBatch() error = %v", err)
 	}
@@ -61,7 +62,7 @@ func TestProcessDetachedBatchApplyErrorSkipsCheckpoint(t *testing.T) {
 
 	plan := batchPlan{checkpoint: 0, targetCheckpoint: 1, rows: []store.PersistedEvent{unitTestEvent(1, "order")}}
 
-	if _, err := daemon.processDetachedBatch(context.Background(), entry, &plan); err == nil {
+	if _, err := daemon.processDetachedBatch(context.Background(), context.Background(), entry, &plan); err == nil {
 		t.Fatal("processDetachedBatch() error = nil, want destination error")
 	}
 
@@ -84,7 +85,7 @@ func TestProcessDetachedBatchCheckpointMoved(t *testing.T) {
 
 	plan := batchPlan{checkpoint: 0, targetCheckpoint: 1, rows: []store.PersistedEvent{unitTestEvent(1, "order")}}
 
-	result, err := daemon.processDetachedBatch(context.Background(), entry, &plan)
+	result, err := daemon.processDetachedBatch(context.Background(), context.Background(), entry, &plan)
 	if err != nil {
 		t.Fatalf("processDetachedBatch() error = %v", err)
 	}
@@ -126,7 +127,7 @@ func TestProcessDetachedBatchGapResolvedRequestsRetry(t *testing.T) {
 		rows:             []store.PersistedEvent{unitTestEvent(2, "order"), unitTestEvent(3, "order")},
 	}
 
-	result, err := daemon.processDetachedBatch(context.Background(), entry, &plan)
+	result, err := daemon.processDetachedBatch(context.Background(), context.Background(), entry, &plan)
 	if err != nil {
 		t.Fatalf("processDetachedBatch() error = %v", err)
 	}
@@ -141,6 +142,145 @@ func TestProcessDetachedBatchGapResolvedRequestsRetry(t *testing.T) {
 	defer state.mu.Unlock()
 	if state.commitCalls != 0 {
 		t.Fatalf("commitCalls = %d, want 0", state.commitCalls)
+	}
+}
+
+// TestDetachedApplyContextIsCappedByBatchDeadline pins the min() rule: a
+// generous apply timeout still cannot outlive the batch deadline.
+func TestDetachedApplyContextIsCappedByBatchDeadline(t *testing.T) {
+	daemon := &Daemon{config: Config{DetachedApplyTimeout: time.Hour}}
+
+	base, cancelBase := context.WithTimeout(context.Background(), time.Second)
+	defer cancelBase()
+
+	ctx, cancel := daemon.detachedApplyContext(base)
+	defer cancel()
+
+	baseDeadline, ok := base.Deadline()
+	if !ok {
+		t.Fatal("base context has no deadline")
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("apply context has no deadline")
+	}
+	if deadline.After(baseDeadline) {
+		t.Fatalf("apply deadline = %v, want at or before the batch deadline %v", deadline, baseDeadline)
+	}
+}
+
+func TestPhaseContextsReturnBaseWithoutTimeout(t *testing.T) {
+	daemon := &Daemon{config: Config{}}
+	base := context.Background()
+
+	applyCtx, cancelApply := daemon.detachedApplyContext(base)
+	defer cancelApply()
+	if applyCtx != base {
+		t.Fatal("detachedApplyContext() = new context, want the base context when no timeout is configured")
+	}
+
+	checkpointCtx, cancelCheckpoint := daemon.checkpointContext(base)
+	defer cancelCheckpoint()
+	if checkpointCtx != base {
+		t.Fatal("checkpointContext() = new context, want the base context when no timeout is configured")
+	}
+}
+
+// TestProcessDetachedBatchCheckpointContextOutlivesBatchContext models a
+// detached handler that consumes the whole batch budget: the batch context is
+// already canceled when the apply returns, yet the checkpoint still commits
+// because it runs on its own budget rooted in the processing context.
+func TestProcessDetachedBatchCheckpointContextOutlivesBatchContext(t *testing.T) {
+	instanceID := uuid.New()
+	state := &stubDBState{ownerID: instanceID.String(), ownerValid: true}
+	projection := &stubDetachedProjection{name: "detached-orders"}
+	entry := registrationForTest(t, projection)
+	daemon := newDetachedTestDaemon(t, state, &stubProjectorStore{})
+
+	batchCtx, cancelBatch := context.WithCancel(context.Background())
+	cancelBatch()
+
+	plan := batchPlan{
+		checkpoint:       0,
+		targetCheckpoint: 1,
+		rows:             []store.PersistedEvent{unitTestEvent(1, "order")},
+	}
+
+	result, err := daemon.processDetachedBatch(context.Background(), batchCtx, entry, &plan)
+	if err != nil {
+		t.Fatalf("processDetachedBatch() error = %v, want a committed checkpoint on an independent context", err)
+	}
+	if !result.progressed || result.checkpoint != 1 {
+		t.Fatalf("result = %#v, want progressed checkpoint 1", result)
+	}
+	if !errors.Is(projection.ctxErr, context.Canceled) {
+		t.Fatalf("apply context error = %v, want context.Canceled (apply is bounded by the batch context)", projection.ctxErr)
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.beginCtxErrs) != 1 {
+		t.Fatalf("checkpoint BeginTx calls = %d, want 1", len(state.beginCtxErrs))
+	}
+	if err := state.beginCtxErrs[0]; err != nil {
+		t.Fatalf("checkpoint context error = %v, want nil (checkpoint must not inherit the batch deadline)", err)
+	}
+}
+
+// TestProcessDetachedBatchCheckpointContextFollowsParent proves the checkpoint
+// phase is rooted in the processing context by canceling that context.
+func TestProcessDetachedBatchCheckpointContextFollowsParent(t *testing.T) {
+	instanceID := uuid.New()
+	state := &stubDBState{ownerID: instanceID.String(), ownerValid: true}
+	projection := &stubDetachedProjection{name: "detached-orders"}
+	entry := registrationForTest(t, projection)
+	daemon := newDetachedTestDaemon(t, state, &stubProjectorStore{})
+
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+
+	plan := batchPlan{
+		checkpoint:       0,
+		targetCheckpoint: 1,
+		rows:             []store.PersistedEvent{unitTestEvent(1, "order")},
+	}
+
+	if _, err := daemon.processDetachedBatch(parentCtx, context.Background(), entry, &plan); err != nil {
+		t.Fatalf("processDetachedBatch() error = %v", err)
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.beginCtxErrs) != 1 {
+		t.Fatalf("checkpoint BeginTx calls = %d, want 1", len(state.beginCtxErrs))
+	}
+	if !errors.Is(state.beginCtxErrs[0], context.Canceled) {
+		t.Fatalf("checkpoint context error = %v, want context.Canceled", state.beginCtxErrs[0])
+	}
+}
+
+// TestProcessDetachedBatchOwnershipLostAfterApply guards the post-apply
+// checkpoint path: ownership lost during the checkpoint must still surface as
+// errProjectionOwnershipLost so the loop stops the projection.
+func TestProcessDetachedBatchOwnershipLostAfterApply(t *testing.T) {
+	instanceID := uuid.New()
+	state := &stubDBState{ownerID: instanceID.String(), ownerValid: false}
+	projection := &stubDetachedProjection{name: "detached-orders"}
+	entry := registrationForTest(t, projection)
+	daemon := newDetachedTestDaemon(t, state, &stubProjectorStore{})
+
+	plan := batchPlan{
+		checkpoint:       0,
+		targetCheckpoint: 1,
+		rows:             []store.PersistedEvent{unitTestEvent(1, "order")},
+	}
+
+	_, err := daemon.processDetachedBatch(context.Background(), context.Background(), entry, &plan)
+	if !errors.Is(err, errProjectionOwnershipLost) {
+		t.Fatalf("error = %v, want errProjectionOwnershipLost", err)
+	}
+	if len(projection.handled) != 1 {
+		t.Fatalf("handled = %d, want 1 (the apply completes before ownership is checked)", len(projection.handled))
 	}
 }
 
@@ -169,7 +309,7 @@ func TestProcessDetachedBatchSerializationRetryAppliesOnce(t *testing.T) {
 		rows:             []store.PersistedEvent{unitTestEvent(2, "order")},
 	}
 
-	result, err := daemon.processDetachedBatch(context.Background(), entry, &plan)
+	result, err := daemon.processDetachedBatch(context.Background(), context.Background(), entry, &plan)
 	if err != nil {
 		t.Fatalf("processDetachedBatch() error = %v", err)
 	}

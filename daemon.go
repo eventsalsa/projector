@@ -1056,7 +1056,7 @@ func (d *Daemon) processBatchWithGapState(
 		}, nil
 	}
 
-	result, err := d.processProbedBatch(ctx, entry, &probe)
+	result, err := d.processProbedBatch(parentCtx, ctx, entry, &probe)
 	duration := timeNow().Sub(start)
 	if err != nil {
 		if d.config.Observer != nil {
@@ -1197,13 +1197,19 @@ func (d *Daemon) probePlan(
 	return probe, nil
 }
 
+// processProbedBatch applies a probed batch either inside the daemon transaction
+// or, for detached projections, outside it.
+//
+// ctx is the batch context, bounded by BatchTimeout. parentCtx is the long-lived
+// processing context; the detached checkpoint phase derives its own budget from
+// parentCtx so a slow external apply cannot starve it.
 func (d *Daemon) processProbedBatch(
-	ctx context.Context,
+	parentCtx, ctx context.Context,
 	entry registration,
 	probe *batchPlan,
 ) (processedBatch, error) {
 	if !entry.applier.transactional() {
-		return d.processDetachedBatch(ctx, entry, probe)
+		return d.processDetachedBatch(parentCtx, ctx, entry, probe)
 	}
 
 	txOptions := pgx.TxOptions{}
@@ -1311,8 +1317,20 @@ func (d *Daemon) processTxBatchAttempt(
 // processDetachedBatch applies the batch with no transaction held and then
 // persists the checkpoint in a short transaction. Delivery is at-least-once, so
 // handlers must be idempotent.
+//
+// It runs three phases with independent budgets. parentCtx is the long-lived
+// processing context and ctx is the batch context, bounded by BatchTimeout.
+//
+//   - Stale-gap revalidation and the external apply run on ctx. The apply is
+//     further bounded by DetachedApplyTimeout, so it stays under the overall
+//     batch cap.
+//   - The checkpoint transaction runs on parentCtx bounded by CheckpointTimeout.
+//     The budget starts when the checkpoint phase starts, after the apply, and
+//     deliberately does not inherit the batch deadline. Otherwise a slow apply
+//     would leave the checkpoint write with a canceled context and force a
+//     duplicate re-apply of the whole window.
 func (d *Daemon) processDetachedBatch(
-	ctx context.Context,
+	parentCtx, ctx context.Context,
 	entry registration,
 	probe *batchPlan,
 ) (processedBatch, error) {
@@ -1333,13 +1351,20 @@ func (d *Daemon) processDetachedBatch(
 		}, nil
 	}
 
+	applyCtx, cancelApply := d.detachedApplyContext(ctx)
+
 	target := probe.targetCheckpoint
-	handledCount, err := entry.applier.apply(ctx, nil, probe.rows)
+	handledCount, err := entry.applier.apply(applyCtx, nil, probe.rows)
+	cancelApply()
+
 	if err != nil {
 		return processedBatch{}, &batchError{cause: err, rows: probe.rows, target: target}
 	}
 
-	result, err := d.commitDetachedCheckpoint(ctx, entry, probe)
+	checkpointCtx, cancelCheckpoint := d.checkpointContext(parentCtx)
+	defer cancelCheckpoint()
+
+	result, err := d.commitDetachedCheckpoint(checkpointCtx, entry, probe)
 	if err != nil {
 		return processedBatch{}, err
 	}
@@ -1355,6 +1380,29 @@ func (d *Daemon) processDetachedBatch(
 	result.staleSkipped = probe.staleSkipped
 
 	return result, nil
+}
+
+// detachedApplyContext bounds the external apply of a detached projection. It
+// derives from the batch context, so the effective budget is
+// min(BatchTimeout, DetachedApplyTimeout).
+func (d *Daemon) detachedApplyContext(base context.Context) (context.Context, context.CancelFunc) {
+	if d.config.DetachedApplyTimeout > 0 {
+		return context.WithTimeout(base, d.config.DetachedApplyTimeout)
+	}
+
+	return base, func() {}
+}
+
+// checkpointContext bounds the post-apply checkpoint phase of a detached
+// projection. It derives from the long-lived processing context rather than the
+// batch context, and callers must call it after the apply so the budget is
+// measured from the start of the checkpoint phase.
+func (d *Daemon) checkpointContext(base context.Context) (context.Context, context.CancelFunc) {
+	if d.config.CheckpointTimeout > 0 {
+		return context.WithTimeout(base, d.config.CheckpointTimeout)
+	}
+
+	return base, func() {}
 }
 
 // commitDetachedCheckpoint persists the checkpoint, and any stale-gap skip, in a
@@ -1954,6 +2002,14 @@ func applyOptions(opts ...Option) Config { //nolint:gocyclo // sequential valida
 	}
 	if config.BatchTimeout <= 0 {
 		config.BatchTimeout = defaults.BatchTimeout
+	}
+	if config.DetachedApplyTimeout <= 0 {
+		// The effective apply budget is min(BatchTimeout, DetachedApplyTimeout),
+		// so the default only has to be generous; BatchTimeout still caps it.
+		config.DetachedApplyTimeout = defaults.DetachedApplyTimeout
+	}
+	if config.CheckpointTimeout <= 0 {
+		config.CheckpointTimeout = defaults.CheckpointTimeout
 	}
 	if config.ShutdownTimeout <= 0 {
 		config.ShutdownTimeout = defaults.ShutdownTimeout
