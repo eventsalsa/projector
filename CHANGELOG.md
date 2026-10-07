@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0](https://github.com/eventsalsa/projector/compare/v0.4.0...v0.5.0) (2026-10-07)
+
+
+### Features
+
+* **projector:** add detached projections and a registry builder ([#19](https://github.com/eventsalsa/projector/issues/19)) ([f17cd1a](https://github.com/eventsalsa/projector/commit/f17cd1ae5fffb4b1c56af9c83a3f69e79cf70ae3))
+* **projector:** add error classification and per-projection failure policy ([#23](https://github.com/eventsalsa/projector/issues/23)) ([bfd156f](https://github.com/eventsalsa/projector/commit/bfd156ff39ccb95c009cd6abf6932b6f63aadb55))
+
+
+### Bug Fixes
+
+* **projector:** avoid racing the leader connection on forced shutdown ([#24](https://github.com/eventsalsa/projector/issues/24)) ([e2e6652](https://github.com/eventsalsa/projector/commit/e2e665212f5489f4d46e4760b52ad2b75915918b))
+
 ## [0.4.0](https://github.com/eventsalsa/projector/compare/v0.3.0...v0.4.0) (2026-08-22)
 
 
