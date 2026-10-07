@@ -81,6 +81,7 @@ type Daemon struct { //nolint:govet // fieldalignment: readability over marginal
 	failedProjections  map[string]error
 	db                 PgxPool
 	leaderConn         *pgxpool.Conn
+	leaderDone         chan struct{}
 	registry           *Registry
 	registrations      []registration
 	registrationByName map[string]registration
@@ -192,8 +193,14 @@ func (d *Daemon) Start(parent context.Context) (err error) {
 
 	d.fatalErrCh = make(chan error, 1)
 
+	leaderDone := make(chan struct{})
+	d.leaderDone = leaderDone
+
 	d.startBackground(controlCtx, func() { d.runHeartbeatLoop(controlCtx) })
-	d.startBackground(controlCtx, func() { d.runLeaderLoop(controlCtx) })
+	d.startBackground(controlCtx, func() {
+		defer close(leaderDone)
+		d.runLeaderLoop(controlCtx)
+	})
 	d.startBackground(controlCtx, func() { d.runAssignmentLoop(controlCtx, processingCtx) })
 	d.startBackground(controlCtx, func() {
 		if runErr := d.dispatcher.Start(controlCtx); runErr != nil && controlCtx.Err() == nil {
@@ -282,6 +289,18 @@ func (d *Daemon) shutdown(registered *bool) {
 		case <-done:
 		case <-time.After(timeout):
 			logger.Error(shutdownCtx, "daemon shutdown did not complete after forced cancellation", "instance_id", d.id)
+		}
+	}
+
+	// A stuck projection can keep the overall wait above from completing, but the
+	// leader loop only needs to stop before the leader connection is released
+	// safely, otherwise releasing it races with an in-flight rebalance.
+	if leaderDone := d.leaderDone; leaderDone != nil {
+		select {
+		case <-leaderDone:
+		case <-time.After(timeout):
+			logger.Error(shutdownCtx, "leader loop did not stop; skipping leader connection release", "instance_id", d.id)
+			return
 		}
 	}
 

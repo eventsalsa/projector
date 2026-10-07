@@ -27,6 +27,7 @@ type faultState struct {
 	mu        sync.Mutex
 	remaining int
 	err       error
+	dropConn  bool
 }
 
 func (s *faultState) arm(failures int, err error) {
@@ -34,18 +35,29 @@ func (s *faultState) arm(failures int, err error) {
 	defer s.mu.Unlock()
 	s.remaining = failures
 	s.err = err
+	s.dropConn = false
 }
 
-func (s *faultState) consume() (error, bool) {
+// armDropConn arms the fault to terminate the backend running the matching
+// statement, simulating a connection drop rather than a statement error.
+func (s *faultState) armDropConn(failures int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.remaining = failures
+	s.err = nil
+	s.dropConn = true
+}
+
+func (s *faultState) consume() (error, bool, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.remaining == 0 {
-		return nil, false
+		return nil, false, false
 	}
 	if s.remaining > 0 {
 		s.remaining--
 	}
-	return s.err, true
+	return s.err, s.dropConn, true
 }
 
 // faultTx delegates everything to the real transaction but can fail a
@@ -57,11 +69,24 @@ type faultTx struct {
 
 func (t *faultTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	if strings.Contains(sql, "projection_checkpoints") {
-		if err, ok := t.state.consume(); ok {
+		if err, drop, ok := t.state.consume(); ok {
+			if drop {
+				return t.terminateBackend(ctx)
+			}
 			return pgconn.CommandTag{}, err
 		}
 	}
 	return t.Tx.Exec(ctx, sql, args...)
+}
+
+// terminateBackend kills the server process running this transaction, so the
+// client observes a genuine connection drop.
+func (t *faultTx) terminateBackend(ctx context.Context) (pgconn.CommandTag, error) {
+	if _, err := t.Tx.Exec(ctx, `SELECT pg_terminate_backend(pg_backend_pid())`); err != nil {
+		return pgconn.CommandTag{}, fmt.Errorf("terminate checkpoint backend: %w", err)
+	}
+
+	return pgconn.CommandTag{}, errors.New("checkpoint connection terminated by the server")
 }
 
 // faultPool implements projector.PgxPool over a real pool and injects the fault
@@ -347,6 +372,49 @@ func TestDetachedProjection_CheckpointSerializationRetryAppliesOnce(t *testing.T
 		if times := projection.timesApplied(event.GlobalPosition); times != 1 {
 			t.Fatalf("event %d applied %d times, want exactly 1 (the checkpoint retry must not repeat the apply)", event.GlobalPosition, times)
 		}
+	}
+
+	harness.stop(t)
+}
+
+func TestDetachedProjection_CheckpointConnectionDropRecovers(t *testing.T) {
+	controlDB := openTestDB(t)
+	defer controlDB.Close()
+	setupSchema(t, controlDB)
+	defer cleanupTables(t, controlDB)
+
+	eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
+	realDB := openTestDBWithMaxConns(t, 8)
+	defer realDB.Close()
+	faults := &faultState{}
+	// The first checkpoint write terminates its own backend, so the client sees a
+	// real connection drop inside the checkpoint transaction.
+	faults.armDropConn(1)
+
+	projection := &scriptedDetachedProjection{name: "detached-conn-drop", entered: make(chan struct{}, 64)}
+	registry := projectorpkg.NewRegistry()
+	if err := registry.AddDetached(projection); err != nil {
+		t.Fatalf("register detached projection: %v", err)
+	}
+
+	options := append(defaultProjectorOptions(), projectorpkg.WithMaxConsecutiveFailures(0))
+	harness := newFaultDaemonHarness(t, realDB, faults, registry, options...)
+
+	appended := appendTestEvents(t, controlDB, eventStore, 3, "Product")
+	latest := appended[len(appended)-1].GlobalPosition
+
+	waitForErr(t, defaultWaitTimeout, func() error {
+		checkpoint := getCheckpoint(t, controlDB, projection.Name())
+		if checkpoint != latest {
+			return fmt.Errorf("checkpoint=%d want %d after recovering from the connection drop", checkpoint, latest)
+		}
+		return nil
+	})
+
+	select {
+	case <-harness.done:
+		t.Fatalf("daemon exited after a checkpoint connection drop: %v", harness.result)
+	default:
 	}
 
 	harness.stop(t)
