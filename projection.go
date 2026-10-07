@@ -51,6 +51,11 @@ type Projection interface {
 // must therefore be idempotent, for example by upserting a document keyed by the
 // stream id with the event's StreamVersion or GlobalPosition as a monotonic
 // version guard.
+//
+// The daemon bounds the apply with WithDetachedApplyTimeout and cancels ctx when
+// the budget runs out, so handlers must return promptly once ctx is done. The
+// checkpoint write afterwards has its own budget (WithCheckpointTimeout) and does
+// not inherit the apply deadline.
 type DetachedProjection interface {
 	// Name returns the unique name of this projection.
 	Name() string
@@ -75,13 +80,15 @@ type BatchProjection interface {
 }
 
 // DetachedBatchProjection is a DetachedProjection that applies a whole batch in
-// one call. The same at-least-once and idempotency requirements apply.
+// one call. The same at-least-once, idempotency, and context-cancellation
+// requirements apply.
 type DetachedBatchProjection interface {
 	// Name returns the unique name of this projection.
 	Name() string
 
 	// Handle applies every event in the batch to the external read model. The
-	// batch contains only events at or below the current safe frontier.
+	// batch contains only events at or below the current safe frontier. It must
+	// honor ctx and return when ctx is done.
 	Handle(ctx context.Context, events []store.PersistedEvent) error
 }
 

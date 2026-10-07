@@ -50,6 +50,8 @@ type Config struct { //nolint:govet // fieldalignment: readability over marginal
 	RebalanceInterval          time.Duration
 	BatchPause                 time.Duration
 	BatchTimeout               time.Duration
+	DetachedApplyTimeout       time.Duration
+	CheckpointTimeout          time.Duration
 	ShutdownTimeout            time.Duration
 	StaleGapThreshold          time.Duration
 	StaleGapHarborLag          int
@@ -73,6 +75,8 @@ func DefaultConfig() Config {
 		RebalanceInterval:          5 * time.Second,
 		BatchPause:                 200 * time.Millisecond,
 		BatchTimeout:               30 * time.Second,
+		DetachedApplyTimeout:       30 * time.Second,
+		CheckpointTimeout:          5 * time.Second,
 		ShutdownTimeout:            5 * time.Second,
 		StaleGapThreshold:          30 * time.Second,
 		Logger:                     store.NoOpLogger{},
@@ -150,9 +154,36 @@ func WithBatchPause(d time.Duration) Option {
 // WithBatchTimeout sets the maximum duration for a single batch processing cycle.
 // If a batch (including DB operations and event handling) exceeds this duration,
 // the context is canceled and the batch is rolled back.
+//
+// For detached projections it bounds the frontier probe and the external apply.
+// The post-apply checkpoint phase has its own budget (WithCheckpointTimeout), so a
+// detached batch cycle can take up to BatchTimeout plus CheckpointTimeout.
 func WithBatchTimeout(d time.Duration) Option {
 	return func(c *Config) {
 		c.BatchTimeout = d
+	}
+}
+
+// WithDetachedApplyTimeout sets the maximum duration of the external apply for a
+// detached projection. It defaults to the same 30s as BatchTimeout, and the
+// effective budget is min(BatchTimeout, DetachedApplyTimeout). Lower it to fail
+// a slow destination sooner than the batch deadline.
+//
+// Handlers must return promptly when the apply context is done; a handler that
+// ignores the context cannot be interrupted.
+func WithDetachedApplyTimeout(d time.Duration) Option {
+	return func(c *Config) {
+		c.DetachedApplyTimeout = d
+	}
+}
+
+// WithCheckpointTimeout sets the maximum duration of the checkpoint phase that
+// follows a detached apply: the checkpoint transaction and its ownership check.
+// The budget starts when that phase starts and is independent of BatchTimeout,
+// so a slow apply cannot starve the checkpoint write.
+func WithCheckpointTimeout(d time.Duration) Option {
+	return func(c *Config) {
+		c.CheckpointTimeout = d
 	}
 }
 
