@@ -190,6 +190,53 @@ func TestFromProjectionsRegistersClassicShape(t *testing.T) {
 	}
 }
 
+func TestFromProjectionsInfersEveryHandlerShape(t *testing.T) {
+	tests := []struct {
+		name          string
+		projection    any
+		transactional bool
+		policy        FailurePolicy
+	}{
+		{"tx-event", &stubTxProjection{name: "tx-event"}, true, FailurePolicyFailFast},
+		{"detached-event", &stubDetachedProjection{name: "detached-event"}, false, FailurePolicyRetry},
+		{"tx-batch", &stubBatchProjection{name: "tx-batch"}, true, FailurePolicyFailFast},
+		{"detached-batch", &stubDetachedBatchProjection{name: "detached-batch"}, false, FailurePolicyRetry},
+	}
+
+	projections := make([]any, 0, len(tests))
+	for _, tc := range tests {
+		projections = append(projections, tc.projection)
+	}
+
+	registry := FromProjections(projections...)
+	if err := registry.validate(); err != nil {
+		t.Fatalf("validate() error = %v", err)
+	}
+	if len(registry.registrations) != len(tests) {
+		t.Fatalf("registrations = %d, want %d", len(registry.registrations), len(tests))
+	}
+
+	for i, tc := range tests {
+		got := registry.registrations[i]
+		if got.name != tc.name {
+			t.Fatalf("registration[%d].name = %q, want %q", i, got.name, tc.name)
+		}
+		if got := got.applier.transactional(); got != tc.transactional {
+			t.Fatalf("%s transactional() = %v, want %v", tc.name, got, tc.transactional)
+		}
+		if got.policy != tc.policy {
+			t.Fatalf("%s policy = %v, want %v", tc.name, got.policy, tc.policy)
+		}
+	}
+}
+
+func TestFromProjectionsRecordsUnknownShapeForStart(t *testing.T) {
+	registry := FromProjections(&stubTxProjection{name: "valid"}, struct{}{})
+	if err := registry.validate(); !errors.Is(err, ErrUnknownProjectionShape) {
+		t.Fatalf("validate() error = %v, want %v", err, ErrUnknownProjectionShape)
+	}
+}
+
 func TestBatchApplierCallsHandlerOnce(t *testing.T) {
 	projection := &stubBatchProjection{name: "batch"}
 	applier := newTxBatchApplier(projection)

@@ -54,14 +54,23 @@ func NewRegistry() *Registry {
 	return &Registry{names: make(map[string]struct{})}
 }
 
-// FromProjections builds a registry from transactional per-event projections.
-// It is a convenience for daemons that only use the classic Projection shape.
+// FromProjections builds a registry from the given projections, inferring each
+// one's handler shape the same way Add does, so any of the four projection
+// shapes can be passed.
+//
+// The parameter is variadic any, so a []Projection slice cannot be spread into
+// it. Callers that hold such a slice convert it to []any first.
+//
+// It is a convenience for registering projections that need no filter, failure
+// policy, or poison handler. Projections that need any of those are registered
+// with NewRegistry and the typed Add* methods.
+//
 // Registration errors are recorded and surfaced by Daemon.Start.
-func FromProjections(projections ...Projection) *Registry {
+func FromProjections(projections ...any) *Registry {
 	registry := NewRegistry()
 	for _, projection := range projections {
 		//nolint:errcheck // registration errors are recorded on the registry and surfaced by Daemon.Start
-		_ = registry.AddProjection(projection)
+		_ = registry.Add(projection)
 	}
 
 	return registry

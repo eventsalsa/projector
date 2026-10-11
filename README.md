@@ -315,7 +315,7 @@ _ = registry.AddDetached(&TypesenseProductProjection{}, projector.OnStreamTypes(
 daemon := projector.New(db, eventStore, registry)
 ```
 
-For daemons that only use the classic shape, `projector.FromProjections(p1, p2)` builds a registry in one call.
+`projector.FromProjections(p1, p2)` builds a registry in one call for projections that need no options. It infers each shape like `Add`, so any of the four shapes can be passed. It takes `...any`, so a `[]Projection` slice must be converted to `[]any` before it can be spread into the call.
 
 ### Registration filters
 
@@ -573,7 +573,8 @@ func main() {
     ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
     defer stop()
 
-    // 1. Initialize domain daemons with lease leader election
+    // 1. Initialize domain daemons with lease leader election.
+    // ledgerProjections and billingProjections are []any, so any handler shape can be registered.
     ledgerDaemon := projector.New(db, ledgerStore, projector.FromProjections(ledgerProjections...),
         projector.WithLeaderStrategy(projector.LeaderStrategyLease),
         projector.WithProjectorLeaderLeasesTable("ledger.projector_leader_leases"),
