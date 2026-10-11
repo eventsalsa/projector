@@ -611,7 +611,13 @@ func startTestProjectorWithTables(
 		db.Close()
 	})
 
-	return startTestProjectorWithPoolAndTable(t, label, db, projectorpkg.FromProjections(projections...), instancesTable, opts...)
+	// FromProjections takes ...any, so a []Projection slice cannot be spread into it.
+	handlers := make([]any, 0, len(projections))
+	for _, projection := range projections {
+		handlers = append(handlers, projection)
+	}
+
+	return startTestProjectorWithPoolAndTable(t, label, db, projectorpkg.FromProjections(handlers...), instancesTable, opts...)
 }
 
 func startTestProjectorWithPool(
