@@ -126,6 +126,7 @@ type stubDBState struct {
 	execQueries      []string
 	execCalls        int
 	beginCalls       int
+	beginCtxErrs     []error
 	commitCalls      int
 	rollbackCalls    int
 	queryCalls       int
@@ -139,11 +140,12 @@ type stubPgxPool struct {
 }
 
 //nolint:gocritic // hugeParam: implements PgxPool interface
-func (p *stubPgxPool) BeginTx(_ context.Context, _ pgx.TxOptions) (pgx.Tx, error) {
+func (p *stubPgxPool) BeginTx(ctx context.Context, _ pgx.TxOptions) (pgx.Tx, error) {
 	p.state.mu.Lock()
 	defer p.state.mu.Unlock()
 
 	p.state.beginCalls++
+	p.state.beginCtxErrs = append(p.state.beginCtxErrs, ctx.Err())
 	p.state.ops = append(p.state.ops, "begin")
 	if p.state.beginErr != nil {
 		return nil, p.state.beginErr

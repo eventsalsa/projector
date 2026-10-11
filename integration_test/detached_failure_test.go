@@ -28,6 +28,77 @@ type faultState struct {
 	remaining int
 	err       error
 	dropConn  bool
+
+	// checkpointHangSQL, when non-empty, replaces the checkpoint write with a
+	// statement that blocks until the checkpoint context is done, so tests can
+	// observe the checkpoint phase budget.
+	checkpointHangSQL string
+	// checkpointExecs counts checkpoint writes, checkpointCtxErrs records the
+	// context error observed when each write started, and checkpointWriteErrs
+	// records the error each write returned.
+	checkpointExecs     int
+	checkpointCtxErrs   []error
+	checkpointWriteErrs []error
+	// checkpointAttempts counts checkpoint transactions that reached the
+	// ownership lock, which is the SELECT ... FOR UPDATE on the checkpoint row.
+	checkpointAttempts int
+}
+
+// armCheckpointHang makes the next checkpoint writes block on sql until their
+// context is done.
+func (s *faultState) armCheckpointHang(sql string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.checkpointHangSQL = sql
+}
+
+func (s *faultState) disarmCheckpointHang() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.checkpointHangSQL = ""
+}
+
+func (s *faultState) checkpointHang() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.checkpointHangSQL
+}
+
+func (s *faultState) observeCheckpointWriteStart(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.checkpointExecs++
+	s.checkpointCtxErrs = append(s.checkpointCtxErrs, ctx.Err())
+}
+
+func (s *faultState) recordCheckpointWriteErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.checkpointWriteErrs = append(s.checkpointWriteErrs, err)
+}
+
+func (s *faultState) observeCheckpointAttempt() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.checkpointAttempts++
+}
+
+// checkpointObservations returns the recorded checkpoint context errors, write
+// errors, write count, and checkpoint-transaction attempt count.
+func (s *faultState) checkpointObservations() ([]error, []error, int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]error(nil), s.checkpointCtxErrs...),
+		append([]error(nil), s.checkpointWriteErrs...),
+		s.checkpointExecs,
+		s.checkpointAttempts
 }
 
 func (s *faultState) arm(failures int, err error) {
@@ -69,6 +140,15 @@ type faultTx struct {
 
 func (t *faultTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	if strings.Contains(sql, "projection_checkpoints") {
+		t.state.observeCheckpointWriteStart(ctx)
+
+		if hangSQL := t.state.checkpointHang(); hangSQL != "" {
+			_, err := t.Tx.Exec(ctx, hangSQL)
+			t.state.recordCheckpointWriteErr(err)
+
+			return pgconn.CommandTag{}, err
+		}
+
 		if err, drop, ok := t.state.consume(); ok {
 			if drop {
 				return t.terminateBackend(ctx)
@@ -77,6 +157,16 @@ func (t *faultTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Com
 		}
 	}
 	return t.Tx.Exec(ctx, sql, args...)
+}
+
+// QueryRow counts checkpoint transactions that reach the ownership lock, which
+// is the only statement here that locks the checkpoint row.
+func (t *faultTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "projection_checkpoints") && strings.Contains(sql, "FOR UPDATE") {
+		t.state.observeCheckpointAttempt()
+	}
+
+	return t.Tx.QueryRow(ctx, sql, args...)
 }
 
 // terminateBackend kills the server process running this transaction, so the
@@ -128,12 +218,63 @@ type scriptedDetachedProjection struct {
 	entered  chan struct{}
 	onHandle func(event store.PersistedEvent)
 
-	mu       sync.Mutex
-	failures map[int64]int
-	err      error
-	failAll  error
-	applied  map[int64]int
-	attempts int
+	// applyDelay makes Handle simulate slow network I/O. When delayAttempts is
+	// positive the sleep applies to that many invocations only, so a test can
+	// model a destination that recovers. ignoreCtx makes the handler sleep
+	// regardless of cancellation, modelling a handler that does not honor ctx.
+	applyDelay    time.Duration
+	delayAttempts int
+	ignoreCtx     bool
+
+	mu        sync.Mutex
+	failures  map[int64]int
+	err       error
+	failAll   error
+	applied   map[int64]int
+	attempts  int
+	delayUsed int
+}
+
+// nextApplyDelay returns the sleep for this invocation and consumes one from the
+// configured budget.
+func (p *scriptedDetachedProjection) nextApplyDelay() time.Duration {
+	if p.applyDelay <= 0 {
+		return 0
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.delayAttempts > 0 {
+		if p.delayUsed >= p.delayAttempts {
+			return 0
+		}
+		p.delayUsed++
+	}
+
+	return p.applyDelay
+}
+
+// sleepApplyDelay honors the context unless the projection is configured to
+// ignore it. It reports false when the context was canceled first.
+func sleepApplyDelay(ctx context.Context, delay time.Duration, ignoreCtx bool) bool {
+	if delay <= 0 {
+		return true
+	}
+	if ignoreCtx {
+		time.Sleep(delay)
+		return true
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (p *scriptedDetachedProjection) Name() string { return p.name }
@@ -157,6 +298,10 @@ func (p *scriptedDetachedProjection) Handle(ctx context.Context, event store.Per
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+
+	if !sleepApplyDelay(ctx, p.nextApplyDelay(), p.ignoreCtx) {
+		return ctx.Err()
 	}
 
 	p.mu.Lock()
@@ -222,17 +367,45 @@ func (p *scriptedDetachedProjection) Attempts() int {
 type scriptedDetachedBatchProjection struct {
 	name string
 
+	// See scriptedDetachedProjection for the delay semantics.
+	applyDelay    time.Duration
+	delayAttempts int
+	ignoreCtx     bool
+
 	mu         sync.Mutex
 	calls      int
 	batchSizes []int
 	failures   map[int64]int
 	err        error
 	applied    map[int64]int
+	delayUsed  int
 }
 
 func (p *scriptedDetachedBatchProjection) Name() string { return p.name }
 
-func (p *scriptedDetachedBatchProjection) Handle(_ context.Context, events []store.PersistedEvent) error {
+func (p *scriptedDetachedBatchProjection) nextApplyDelay() time.Duration {
+	if p.applyDelay <= 0 {
+		return 0
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.delayAttempts > 0 {
+		if p.delayUsed >= p.delayAttempts {
+			return 0
+		}
+		p.delayUsed++
+	}
+
+	return p.applyDelay
+}
+
+func (p *scriptedDetachedBatchProjection) Handle(ctx context.Context, events []store.PersistedEvent) error {
+	if !sleepApplyDelay(ctx, p.nextApplyDelay(), p.ignoreCtx) {
+		return ctx.Err()
+	}
+
 	p.mu.Lock()
 	p.calls++
 	p.batchSizes = append(p.batchSizes, len(events))
@@ -624,6 +797,9 @@ func TestDetachedProjection_ApplyExceedsBatchTimeoutRecovers(t *testing.T) {
 	options := append(defaultProjectorOptions(),
 		projectorpkg.WithMaxConsecutiveFailures(0),
 		projectorpkg.WithBatchTimeout(300*time.Millisecond),
+		// Longer than BatchTimeout on purpose: the apply budget is
+		// min(BatchTimeout, DetachedApplyTimeout), so the batch cap still binds.
+		projectorpkg.WithDetachedApplyTimeout(time.Minute),
 	)
 	harness := startTestProjectorFromRegistry(t, "projector-1", registry, 8, options...)
 

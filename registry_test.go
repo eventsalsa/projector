@@ -30,12 +30,14 @@ type stubDetachedProjection struct {
 	name    string
 	handled []store.PersistedEvent
 	err     error
+	ctxErr  error
 }
 
 func (p *stubDetachedProjection) Name() string { return p.name }
 
 //nolint:gocritic // hugeParam: implements the DetachedProjection contract
-func (p *stubDetachedProjection) Handle(_ context.Context, event store.PersistedEvent) error {
+func (p *stubDetachedProjection) Handle(ctx context.Context, event store.PersistedEvent) error {
+	p.ctxErr = ctx.Err()
 	if p.err != nil {
 		return p.err
 	}

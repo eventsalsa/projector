@@ -194,7 +194,9 @@ daemon := projector.New(db, eventStore, registry,
 | `WithHeartbeatTimeout(d time.Duration)` | Heartbeat staleness timeout | `30s` |
 | `WithRebalanceInterval(d time.Duration)` | Leader rebalance check interval | `5s` |
 | `WithBatchPause(d time.Duration)` | Pause between consecutive full batches during catch-up | `200ms` |
-| `WithBatchTimeout(d time.Duration)` | Maximum duration for a single batch processing cycle (for detached projections, the external apply) | `30s` |
+| `WithBatchTimeout(d time.Duration)` | Maximum duration for a single batch processing cycle: the frontier probe and the detached external apply | `30s` |
+| `WithDetachedApplyTimeout(d time.Duration)` | Maximum duration of the external apply for a detached projection; the effective budget is `min(BatchTimeout, DetachedApplyTimeout)` | `30s` |
+| `WithCheckpointTimeout(d time.Duration)` | Maximum duration of the post-apply detached checkpoint phase, independent of `BatchTimeout` | `5s` |
 | `WithShutdownTimeout(d time.Duration)` | Maximum duration to wait for graceful daemon shutdown | `5s` |
 | `WithMaxConsecutiveFailures(n int)` | Maximum consecutive unclassified failures before a `FailurePolicyFailFast` projection triggers fatal shutdown | `5` |
 | `WithLogger(l store.Logger)` | Custom logger implementation | `store.NoOpLogger{}` |
@@ -346,6 +348,16 @@ Detached projections are applied outside the daemon transaction and checkpointed
 Detached handlers must therefore be idempotent. Use a deterministic document id (for example the entity's stream id for state projections) and a monotonic version guard built from `StreamVersion` or `GlobalPosition` so a replayed older event cannot overwrite newer state. Destination error `k` of `N` fails the whole batch; the checkpoint is never advanced past work that was not applied.
 
 The safe-harbor stale-gap behavior applies to detached projections too. Before applying, the daemon revalidates the plan in a short read-only transaction and freezes the applied set and checkpoint target. If the gap closes while the batch is being applied, the checkpoint write is discarded and the batch is re-probed rather than skipping the newly available event.
+
+### Detached phase budgets
+
+A detached batch runs three phases with separate budgets:
+
+- The frontier probe and stale-gap revalidation share `BatchTimeout`.
+- The external apply is bounded by `min(BatchTimeout, DetachedApplyTimeout)`. Lower `DetachedApplyTimeout` below `BatchTimeout` to reserve room for the rest of the batch.
+- The checkpoint transaction that follows the apply is bounded by `CheckpointTimeout`, measured from the start of the checkpoint phase and rooted in the daemon's processing context. It never inherits the batch deadline, so a slow destination cannot leave the checkpoint write with a canceled context and force the whole window to be applied again.
+
+A detached batch cycle can therefore take up to `BatchTimeout + CheckpointTimeout`, and `BatchStats.Duration` can exceed `BatchTimeout`. Handlers must return promptly once the apply context is done: a handler that ignores cancellation cannot be interrupted, and only the checkpoint budget is protected from it.
 
 ### Failure policy
 
